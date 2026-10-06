@@ -150,15 +150,23 @@ export class CesiumLosProbe {
         const where = (zone: ResolvedZone) => `${km(dist)} away · ${zone.name}`;
 
         if (ridge > 0 && Math.tan(targetAngle) < horizon) {
-            // Height above this spot's ground of the lowest beam that clears the hill.
-            const lowestSeen = CesiumRadarCoverage.beamHeightAt(ridgeAngle, dist, geometry.radarHeight) - heights[last];
+            const beamMinAngle = Cesium.Math.toRadians(Math.max(...inRange.map(z => z.minElevationDeg)));
+            const beamMaxAngle = Cesium.Math.toRadians(Math.max(...inRange.map(z => z.maxElevationDeg)));
+            const requiredAngle = Math.max(ridgeAngle, beamMinAngle);
+            const beamCanClearRidge = ridgeAngle <= beamMaxAngle;
+            // Height above this spot's ground where the beam first clears the ridge.
+            const lowestSeen = CesiumRadarCoverage.beamHeightAt(requiredAngle, dist, geometry.radarHeight) - heights[last];
             const behind = dist - dists[ridge];
             const higherBy = heights[last] - heights[ridge];
             this.drawBlocked(geometry, azimuthDeg, dists[ridge], heights[ridge], ridgeAngle, dist, heights[last], agl);
             return this.finish(token, points[last], heights[last], {
                 status: "blocked",
-                title: `HIDDEN - higher ground ${km(dists[ridge])} away`,
-                details: [`Seen here only above ${km(lowestSeen)}`],
+                title: beamCanClearRidge
+                    ? `HIDDEN - higher ground ${km(dists[ridge])} away`
+                    : `BLOCKED - beam cannot clear terrain`,
+                details: beamCanClearRidge
+                    ? [`Need at least ${Cesium.Math.toDegrees(requiredAngle).toFixed(1)}° and ${km(lowestSeen)} AGL`]
+                    : [`Terrain needs ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}°; beam tops at ${Cesium.Math.toDegrees(beamMaxAngle).toFixed(1)}°`],
                 explanation: [
                     `Ground ${km(dists[ridge])} from the radar is in the way: it rises to ` +
                     `${Math.round(heights[ridge])} m, ${Math.round(heights[ridge] - geometry.radarHeight)} m ` +
@@ -170,10 +178,16 @@ export class CesiumLosProbe {
                     // the beam climbs to get over the hill and keeps climbing.
                     `The ground here is ${Math.round(Math.abs(higherBy))} m ${higherBy > 0 ? "higher" : "lower"} ` +
                     `than that point and ${km(behind)} behind it.`,
-                    `To get over it the beam must climb at least ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}°, ` +
-                    `so above this spot it only comes down to ${km(lowestSeen)} above the ground.`,
-                    `An aircraft ${agl} m above the ground here is ${km(lowestSeen - agl)} too low to be seen. ` +
-                    `Anything flying higher than ${km(lowestSeen)} would be detected.`,
+                    ...(beamCanClearRidge
+                        ? [
+                            `To get over it and reach this object's height, the beam must cover at least ${Cesium.Math.toDegrees(requiredAngle).toFixed(1)}°. ` +
+                            `On this bearing, an object must be at least ${km(lowestSeen)} above ground and within the beam's angle range.`,
+                            `An aircraft ${agl} m above the ground here is ${km(Math.max(0, lowestSeen - agl))} too low to be seen.`
+                        ]
+                        : [
+                            `The terrain requires a ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}° beam, but this beam only reaches ` +
+                            `${Cesium.Math.toDegrees(beamMaxAngle).toFixed(1)}°. Objects behind this ridge cannot be detected at the current angle settings.`
+                        ]),
                     `${km(dist)} from the radar, inside ${inRange[0].name}'s range.`
                 ]
             }, false);
@@ -211,10 +225,10 @@ export class CesiumLosProbe {
             title: "VISIBLE",
             details: [where(litBy)],
             explanation: [
-                `Nothing blocks the line from the radar to an aircraft ${agl} m above this spot.`,
+                `No terrain blocks the line from the radar to an aircraft ${agl} m above this spot on this bearing.`,
                 `It is ${targetDeg.toFixed(1)}° up from the antenna, inside ${litBy.name}'s beam ` +
                 `(${litBy.minElevationDeg}° to ${litBy.maxElevationDeg}°, ${km(litBy.range)} range).`,
-                `${km(dist)} from the radar.`
+                `${km(dist)} from the radar. Objects at this spot are detectable on this bearing when they are within the beam's elevation range.`
             ]
         }, false);
     }
@@ -347,7 +361,12 @@ export class CesiumLosProbe {
         this.addLine([overSpot, agl > 0 ? aircraft : spotGround], COLOR_BLOCKED, true);
         this.drawAircraft(spotGround, aircraft, agl);
 
-        this.addTag(overSpot, `Beam ${km(beamOverSpot - groundHeight)} up`, COLOR_GRAZING, Cesium.VerticalOrigin.BOTTOM);
+        this.addTag(
+            overSpot,
+            `Terrain clears at ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}° · ${km(beamOverSpot - groundHeight)} up`,
+            COLOR_GRAZING,
+            Cesium.VerticalOrigin.BOTTOM
+        );
 
         this.add({
             position: this.positionOf(ridgeTop),

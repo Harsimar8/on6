@@ -92,12 +92,14 @@
             <span>Min Angle (bottom of beam)</span>
             <div class="beam-value">
               <input class="beam-number" type="number" min="-10" max="90" step="0.5"
+                [max]="beam().maxElevationDeg"
                 [value]="beam().minElevationDeg"
                 (change)="onBeamChange('beamMinElevationDeg', $any($event.target).value)">
               <em>°</em>
             </div>
           </div>
           <input class="beam-slider" type="range" min="-10" max="90" step="0.5"
+            [max]="beam().maxElevationDeg"
             [value]="beam().minElevationDeg"
             (input)="onBeamChange('beamMinElevationDeg', $any($event.target).value)">
           <div class="beam-control__range"><span>-10°</span><span>90°</span></div>
@@ -108,12 +110,14 @@
             <span>Max Angle (top of beam)</span>
             <div class="beam-value">
               <input class="beam-number" type="number" min="-10" max="90" step="0.5"
+                [min]="beam().minElevationDeg"
                 [value]="beam().maxElevationDeg"
                 (change)="onBeamChange('beamMaxElevationDeg', $any($event.target).value)">
               <em>°</em>
             </div>
           </div>
           <input class="beam-slider" type="range" min="-10" max="90" step="0.5"
+            [min]="beam().minElevationDeg"
             [value]="beam().maxElevationDeg"
             (input)="onBeamChange('beamMaxElevationDeg', $any($event.target).value)">
           <div class="beam-control__range"><span>-10°</span><span>90°</span></div>
@@ -150,8 +154,9 @@
         </label>
 
         <div class="zone-card__hint">
-          0 = the ground itself. Raise the min angle and the beam lifts over the hills, so the red area
-          shrinks; lower it and more terrain cuts into the beam, so the red area grows.
+          The beam spans the full width and the min-to-max elevation angles. Raise the min angle to lift
+          its bottom edge, or raise the max angle to lift its top edge. Terrain blocks each direction
+          independently; use Explain Blocking to see the minimum height and angle needed to clear a ridge.
         </div>
       </section>
 
@@ -267,7 +272,7 @@
           <input type="checkbox"
             [checked]="losProbeEnabled()"
             (change)="onLosProbeToggle($any($event.target).checked)">
-          <span>Explain Blocking on Click</span>
+          <span>Show Detection / Blocking Info</span>
         </label>
 
         @if (losProbeEnabled()) {
@@ -278,7 +283,8 @@
             <span>Follow Mouse</span>
           </label>
           <div class="zone-card__hint">
-            {{ losProbeHover() ? 'Move the mouse' : 'Click any spot' }} inside the beam to see the radar's line of sight to it.
+            {{ losProbeHover() ? 'Move the mouse' : 'Click any spot' }} to see line of sight and detection height
+            on that exact bearing. A clear result applies only to that direction through the beam.
           </div>
         }
 

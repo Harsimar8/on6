@@ -488,7 +488,16 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
     const v = +value;
     if (!Number.isFinite(v)) return;
     const [lo, hi] = CesiumMap.BEAM_LIMITS[key] ?? [-Infinity, Infinity];
-    this.updateRadarProperty({ [key]: Math.min(hi, Math.max(lo, v)) });
+    const bounded = Math.min(hi, Math.max(lo, v));
+    const beam = this.beam();
+
+    if (key === 'beamMinElevationDeg') {
+      this.updateRadarProperty({ [key]: Math.min(bounded, beam.maxElevationDeg) });
+    } else if (key === 'beamMaxElevationDeg') {
+      this.updateRadarProperty({ [key]: Math.max(bounded, beam.minElevationDeg) });
+    } else {
+      this.updateRadarProperty({ [key]: bounded });
+    }
   }
 
   onStyleChange(patch: Partial<RadarStyle>): void {
