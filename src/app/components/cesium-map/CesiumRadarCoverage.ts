@@ -60,6 +60,8 @@ export interface BlockedSector {
     nearestHitM: number;
     // Lowest beam angle that clears the terrain across the whole sector.
     clearDeg: number;
+    // Every direction of the beam is blocked (no clear gap anywhere).
+    allRound: boolean;
 }
 
 // What the beam at its current angle reaches, for the panel.
@@ -182,6 +184,9 @@ const HIDDEN_RGB = [31, 41, 55];       // #1f2937  footprint: ground hidden by t
 const CLEAR_COLOR = Cesium.Color.fromBytes(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2]);
 const BLOCKED_COLOR = Cesium.Color.fromBytes(BLOCKED_RGB[0], BLOCKED_RGB[1], BLOCKED_RGB[2]);
 const HIT_LINE_COLOR = Cesium.Color.fromCssColorString("#7f1d1d");
+// Green ground under the beam is drawn this much fainter than the red, so
+// the blocked areas stand out.
+const REACH_ALPHA = 0.55;
 const RAY_HIT_COLOR = Cesium.Color.fromCssColorString("#f59e0b");   // ray stopped by terrain
 const RAY_CLEAR_COLOR = Cesium.Color.fromCssColorString("#bbf7d0"); // ray reaches full range
 
@@ -229,6 +234,7 @@ const SECTOR_MERGE_GAP_DEG = 1;
 // (those are still in the panel list).
 const MAX_SECTOR_LABELS = 6;
 const MIN_LABEL_WIDTH_DEG = 3;
+const LABEL_MIN_RANGE_FRACTION = 0.45;
 // Bins of the horizon profile handed to the panel chart.
 const HORIZON_BINS = 180;
 // Footprint texture: largest side in pixels, and footprints kept from
@@ -590,7 +596,10 @@ export class CesiumRadarCoverage {
                 toDeg: norm(rowAz[run[1]] + rowStepDeg / 2),
                 widthDeg,
                 nearestHitM: nearest,
-                clearDeg: clear
+                clearDeg: clear,
+                // Merging small gaps can make a sector wrap all the way round;
+                // it is only "all round" when no direction in it is clear.
+                allRound: grid.wrap && rs.length >= rows && rs.every(r => tips.hit[r])
             };
         });
         sectors.sort((a, b) => b.widthDeg - a.widthDeg);
@@ -934,9 +943,33 @@ export class CesiumRadarCoverage {
         const { rowAz, rowStepDeg, zone } = grid;
         const half = rowStepDeg / 2;
         let fillColor = BLOCKED_COLOR.withAlpha(DEFAULT_RADAR_STYLE.blockedOpacity);
+        let reachColor = CLEAR_COLOR.withAlpha(DEFAULT_RADAR_STYLE.blockedOpacity * REACH_ALPHA);
         const material = new Cesium.ColorMaterialProperty(new Cesium.CallbackProperty(() => fillColor, false));
         const fills: Cesium.Entity[] = [];
         const hitLines: Cesium.Cartesian3[][] = [];
+
+        // Green: the ground under the beam, from the radar out to where the
+        // beam ends in each direction (the full range, or the hill it hits).
+        // It meets the red exactly at the hit line, so inside the range every
+        // spot is either green (the beam passes over it) or red (cut off).
+        const tipRing = Array.from({ length: rows }, (_, r) =>
+            CesiumRadarCoverage.planePoint(grid, rowAz[r], tips.dist[r]));
+        const reachPositions = grid.wrap
+            ? tipRing
+            : [
+                CesiumRadarCoverage.planePoint(grid, 0, 0),
+                CesiumRadarCoverage.planePoint(grid, rowAz[0] - half, tips.dist[0]),
+                ...tipRing,
+                CesiumRadarCoverage.planePoint(grid, rowAz[rows - 1] + half, tips.dist[rows - 1])
+            ];
+        const reach = viewer.entities.add({
+            polygon: {
+                hierarchy: new Cesium.PolygonHierarchy(reachPositions),
+                material: new Cesium.ColorMaterialProperty(new Cesium.CallbackProperty(() => reachColor, false)),
+                classificationType: Cesium.ClassificationType.TERRAIN
+            }
+        });
+        (reach as any).radarParentId = entityId;
 
         const arc = (fromAz: number, toAz: number) => {
             const steps = Math.max(1, Math.ceil(Math.abs(toAz - fromAz) / ARC_STEP_DEG));
@@ -997,13 +1030,16 @@ export class CesiumRadarCoverage {
             dispose: () => {
                 viewer.entities.suspendEvents();
                 for (const f of fills) viewer.entities.remove(f);
+                viewer.entities.remove(reach);
                 viewer.entities.resumeEvents();
                 if (outline) viewer.scene.primitives.remove(outline);
             },
             setStyle: (st: RadarStyle) => {
                 const opacity = Cesium.Math.clamp(st.blockedOpacity, 0, 1);
                 fillColor = BLOCKED_COLOR.withAlpha(opacity);
+                reachColor = CLEAR_COLOR.withAlpha(opacity * REACH_ALPHA);
                 for (const f of fills) f.show = st.showBlocked && opacity > 0;
+                reach.show = st.showBlocked && opacity > 0;
                 if (outline) outline.show = st.showBlocked;
             }
         };
@@ -1183,7 +1219,15 @@ export class CesiumRadarCoverage {
                 if (rel <= sector.widthDeg + grid.rowStepDeg) { best = r; break; }
             }
             if (best < 0) continue;
-            const g = CesiumRadarCoverage.groundAt(grid, best, tips.dist[best], lastCol);
+            // In the middle of the sector, out in its red area: past the hit,
+            // and at least LABEL_MIN_RANGE_FRACTION of the range out, so
+            // labels of sectors blocked close to the radar do not pile up on it.
+            const midRow = sector.allRound ? best : CesiumRadarCoverage.rowNearest(grid,
+                sector.fromDeg + sector.widthDeg / 2, best);
+            const from = tips.hit[midRow] ? tips.dist[midRow] : sector.nearestHitM;
+            const range = grid.zone.range;
+            const at = Math.min(range * 0.95, Math.max(from + (range - from) * 0.35, range * LABEL_MIN_RANGE_FRACTION));
+            const g = CesiumRadarCoverage.groundAt(grid, midRow, at, lastCol);
             const label = labels.add({
                 position: Cesium.Cartesian3.fromRadians(g.lon, g.lat, g.height + 30),
                 text: `Blocked ${CesiumRadarCoverage.formatSector(sector)}\n` +
@@ -1205,6 +1249,16 @@ export class CesiumRadarCoverage {
         };
     }
 
+    // Grid row whose direction is nearest this bearing (fallback if none).
+    private static rowNearest(grid: RayGrid, bearingDeg: number, fallback: number): number {
+        let best = fallback, bestDiff = Infinity;
+        grid.rowAz.forEach((az, r) => {
+            const diff = Math.abs((((az - bearingDeg) % 360) + 540) % 360 - 180);
+            if (diff < bestDiff) { bestDiff = diff; best = r; }
+        });
+        return best;
+    }
+
     static compassOf(deg: number): string {
         const names = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
         return names[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
@@ -1213,7 +1267,7 @@ export class CesiumRadarCoverage {
     // "42°–87° (NE)": the bearing range and the compass direction of its middle.
     static formatSector(sector: BlockedSector): string {
         const mid = sector.fromDeg + sector.widthDeg / 2;
-        if (sector.widthDeg >= 359.5) return "all round";
+        if (sector.allRound) return "all round";
         return `${Math.round(sector.fromDeg)}°–${Math.round(sector.toDeg)}° (${CesiumRadarCoverage.compassOf(mid)})`;
     }
 

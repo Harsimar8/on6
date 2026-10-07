@@ -270,12 +270,12 @@
           <input type="checkbox"
             [checked]="radarStyle().showBlocked"
             (change)="onStyleChange({ showBlocked: $any($event.target).checked })">
-          <span>Show Blocked Ground (red)</span>
+          <span>Show Ground Shading (green = beam reaches, red = cut off behind terrain)</span>
         </label>
 
         <div class="beam-control">
           <div class="beam-control__header">
-            <span>Blocked Ground Opacity</span>
+            <span>Ground Shading Opacity</span>
             <strong>{{ radarStyle().blockedOpacity * 100 | number:'1.0-0' }}%</strong>
           </div>
           <input class="beam-slider" type="range" min="0" max="1" step="0.01"
