@@ -6,6 +6,7 @@ import { TeamFilterService } from "../../core/services/TeamFilterService";
 import { Team } from "../../core/types/Team";
 import { TeamFilter } from "../../core/models/TeamFilter";
 import {
+    BeamScanResult,
     CesiumRadarCoverage,
     RadarCoverageHandle,
     RadarStyle
@@ -43,11 +44,20 @@ export class CesiumEntityRenderer {
     // style changes that arrived while it was running.
     private readonly latestEntity = new Map<string, Entity>();
 
+    // Every coverage built for a radar and not yet removed: normally just the
+    // one on screen. When a build is put on screen, all the others are removed,
+    // so no older beam can ever be left behind.
+    private readonly liveBuilds = new Map<string, Set<RadarCoverageHandle[]>>();
+
     constructor(
         private viewer: Cesium.Viewer,
         private terrainProvider: Cesium.TerrainProvider,
         private teamFilterService: TeamFilterService,
-        private editorState: EditorState
+        private editorState: EditorState,
+        // Called with what the beam reaches each time a radar is rebuilt.
+        private onScan?: (entityId: string, scan: BeamScanResult) => void,
+        // Called when a radar starts (true) and finishes (false) rebuilding.
+        private onBuilding?: (entityId: string, building: boolean) => void
     ) { }
 
     render(entities: Entity[]): void {
@@ -94,13 +104,48 @@ export class CesiumEntityRenderer {
         this.latestEntity.delete(entityId);
     }
 
-    private disposeRadarCoverage(entityId: string): void {
-        const existing = this.radarEntities.get(entityId);
-        if (existing) {
-            for (const handle of existing) {
+    private disposeBuild(entityId: string, handles: RadarCoverageHandle[]): void {
+        // One piece failing to go must not leave the others on the map.
+        for (const handle of handles) {
+            try {
                 handle.dispose();
+            } catch (err) {
+                console.error("Failed to remove part of a radar coverage:", err);
             }
         }
+        this.liveBuilds.get(entityId)?.delete(handles);
+        // The viewer only redraws on request: without this the removed beam
+        // stays on screen until something else (e.g. the camera) moves.
+        this.redrawFor();
+    }
+
+    // Keeps redrawing for a short while. One redraw is not always enough:
+    // newly added beams and draped ground shapes finish setting up over the
+    // next frames, and with nothing else asking for a redraw (e.g. at the
+    // all-clear angle, where there is no blocked ground left to draw) the new
+    // beam would only appear once the camera or a setting changed.
+    private redrawFrame: number | null = null;
+    private redrawUntil = 0;
+
+    private redrawFor(ms = 1500): void {
+        this.redrawUntil = Math.max(this.redrawUntil, performance.now() + ms);
+        if (this.redrawFrame !== null) return;
+        const tick = () => {
+            this.viewer.scene.requestRender();
+            this.redrawFrame = performance.now() < this.redrawUntil ? requestAnimationFrame(tick) : null;
+        };
+        tick();
+    }
+
+    /** Removes every build of this radar except `keep`. */
+    private disposeBuildsExcept(entityId: string, keep?: RadarCoverageHandle[]): void {
+        for (const handles of [...(this.liveBuilds.get(entityId) ?? [])]) {
+            if (handles !== keep) this.disposeBuild(entityId, handles);
+        }
+    }
+
+    private disposeRadarCoverage(entityId: string): void {
+        this.disposeBuildsExcept(entityId);
         this.radarEntities.delete(entityId);
         this.lastBuiltSignature.delete(entityId);
     }
@@ -130,7 +175,6 @@ export class CesiumEntityRenderer {
             // Opacities / show toggles are deliberately not here: they are
             // applied in place by applyStyle.
             beam: CesiumRadarCoverage.beamOf(props),
-            showBlockedPoints: props.showBlockedPoints ?? false,
             azimuthStepDeg: props.azimuthStepDeg
         });
     }
@@ -142,13 +186,16 @@ export class CesiumEntityRenderer {
 
         if (this.lastBuiltSignature.get(entity.id) === signature) {
             // Geometry unchanged - at most the look changed, which is cheap.
+            // Back to what is on screen: an angle parked meanwhile is stale.
+            this.pendingRebuild.delete(entity.id);
             this.applyStyle(entity);
             return;
         }
 
-        // Remove the previous geometry as soon as its inputs change, rather
-        // than leaving it on the map while terrain sampling rebuilds it.
+        // The old coverage goes at once; the new one is drawn when it is ready
+        // (the panel shows "Updating radar beam" meanwhile).
         this.disposeRadarCoverage(entity.id);
+        this.onBuilding?.(entity.id, true);
 
         if (this.buildInFlight.has(entity.id)) {
             // Park the newest state; the running build rebuilds from it when
@@ -158,6 +205,7 @@ export class CesiumEntityRenderer {
         }
 
         this.buildInFlight.add(entity.id);
+        this.onBuilding?.(entity.id, true);
 
         try {
 
@@ -173,26 +221,33 @@ export class CesiumEntityRenderer {
                     altitude: entity.position.altitude,
                     beam: CesiumRadarCoverage.beamOf(props),
                     azimuthStepDeg: props.azimuthStepDeg,
-                    showBlockedPoints: props.showBlockedPoints ?? false,
                     style: this.styleOf(entity)
                 }
             );
+            if (!this.liveBuilds.has(entity.id)) this.liveBuilds.set(entity.id, new Set());
+            this.liveBuilds.get(entity.id)!.add(newHandles);
 
             const latest = this.latestEntity.get(entity.id);
             if (!latest || this.buildSignature(latest) !== signature) {
-                for (const handle of newHandles) handle.dispose();
+                // Settings changed while it was building: the newer build replaces it.
+                this.disposeBuild(entity.id, newHandles);
                 return;
             }
 
+            // Put the new build on screen and remove every older one.
+            this.disposeBuildsExcept(entity.id, newHandles);
             this.radarEntities.set(entity.id, newHandles);
             this.lastBuiltSignature.set(entity.id, signature);
+
+            const scan = newHandles.find(h => h.scan)?.scan;
+            if (scan) this.onScan?.(entity.id, scan);
 
             // The new build used the style from when it started; bring it up to
             // date with any slider moves made while it was running.
             this.lastAppliedStyle.delete(entity.id);
             this.applyStyle(this.latestEntity.get(entity.id) ?? entity);
 
-            this.viewer.scene.requestRender();
+            this.redrawFor();
 
         } catch (err) {
             console.error("Failed to render 3D radar coverage:", err);
@@ -203,8 +258,10 @@ export class CesiumEntityRenderer {
 
             if (pending) {
                 this.pendingRebuild.delete(entity.id);
-                this.syncRadarCoverage(pending);
+                // Always the newest state, never an older parked one.
+                this.syncRadarCoverage(this.latestEntity.get(entity.id) ?? pending);
             }
+            this.onBuilding?.(entity.id, this.buildInFlight.has(entity.id));
         }
     }
 

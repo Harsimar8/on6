@@ -6,12 +6,13 @@ import {
   ViewChild,
   inject,
   effect,
-  signal
+  signal,
+  computed
 } from '@angular/core';
 
 import * as Cesium from 'cesium';
 import { CommonModule } from '@angular/common';
-import { BeamSettings, CesiumRadarCoverage, RadarStyle } from './CesiumRadarCoverage';
+import { BeamScanResult, BeamSettings, BlockedSector, CesiumRadarCoverage, RadarStyle } from './CesiumRadarCoverage';
 import { CesiumPlacement } from './CesiumPlacement';
 import { CesiumEntityRenderer } from "./CesiumEntityRenderer";
 import { CesiumHover } from "./CesiumHover";
@@ -119,6 +120,7 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
       if (id !== this.lastSelectedEntityId) {
         this.lastSelectedEntityId = id;
         this.radarPanelClosed.set(false);
+        if (this.scanEntityId && this.scanEntityId !== id) this.stopScan();
       }
     });
 
@@ -158,6 +160,37 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
   protected readonly losProbeHover = signal(false);
   private hoverProbeBusy = false;
   private hoverProbePending: Cesium.Cartesian2 | null = null;
+
+  // What each radar's beam reaches at its current angle (from the last build).
+  private readonly scans = signal<Record<string, BeamScanResult>>({});
+  protected readonly scan = computed(() => {
+    const id = this.editorState.selectedEntity()?.id;
+    return id ? this.scans()[id] ?? null : null;
+  });
+
+  // Radars whose coverage is being rebuilt right now.
+  private readonly buildingIds = signal<ReadonlySet<string>>(new Set());
+  protected readonly building = computed(() => {
+    const id = this.editorState.selectedEntity()?.id;
+    return !!id && this.buildingIds().has(id);
+  });
+  protected readonly anyBuilding = computed(() => this.buildingIds().size > 0);
+
+  // Auto scan: raise the beam angle a step at a time until every direction
+  // is clear (or the top angle is reached).
+  protected readonly scanRunning = signal(false);
+  protected readonly scanStepDeg = signal(0.25);
+  protected readonly scanIntervalMs = signal(600);
+  protected readonly scanStopWhenClear = signal(true);
+  protected readonly scanStepOptions = [0.1, 0.25, 0.5, 1];
+  protected readonly scanSpeedOptions = [
+    { label: 'Slow', ms: 1200 },
+    { label: 'Normal', ms: 600 },
+    { label: 'Fast', ms: 250 }
+  ];
+  private scanTimer?: ReturnType<typeof setInterval>;
+  private scanEntityId: string | null = null;
+  private static readonly SCAN_MAX_DEG = 45;
 
   private glbManager!: CesiumGlbManager;
   protected readonly placedGlbs = signal<PlacedGlb[]>([]);
@@ -240,7 +273,14 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
       this.viewer,
       terrainProvider,
       this.teamFilterService,
-      this.editorState
+      this.editorState,
+      (entityId, scan) => this.scans.update(all => ({ ...all, [entityId]: scan })),
+      (entityId, busy) => this.buildingIds.update(ids => {
+        if (ids.has(entityId) === busy) return ids;
+        const next = new Set(ids);
+        if (busy) next.add(entityId); else next.delete(entityId);
+        return next;
+      })
     );
 
 
@@ -470,35 +510,145 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
     return CesiumRadarCoverage.styleOf(this.getRadarProps());
   }
 
-  protected readonly beamWidthPresets = [30, 60, 90, 180, 360];
+  protected readonly beamWidthPresets = [45, 90, 120, 180, 360];
 
   // Allowed range of every beam value typed in or slid.
   private static readonly BEAM_LIMITS: Record<string, [number, number]> = {
     beamAzimuthDeg: [0, 359.9],
     beamWidthDeg: [1, 360],
-    beamMinElevationDeg: [-10, 90],
-    beamMaxElevationDeg: [-10, 90],
+    beamElevationDeg: [-5, CesiumMap.SCAN_MAX_DEG],
     beamRange: [500, 100000],
-    beamWallDetailDeg: [0.5, 5],
-    raysAcross: [1, 180],
-    raysUp: [1, 60]
+    raysAcross: [1, 180]
   };
 
   onBeamChange(key: string, value: string): void {
     const v = +value;
     if (!Number.isFinite(v)) return;
     const [lo, hi] = CesiumMap.BEAM_LIMITS[key] ?? [-Infinity, Infinity];
-    const bounded = Math.min(hi, Math.max(lo, v));
-    const beam = this.beam();
-
-    if (key === 'beamMinElevationDeg') {
-      this.updateRadarProperty({ [key]: Math.min(bounded, beam.maxElevationDeg) });
-    } else if (key === 'beamMaxElevationDeg') {
-      this.updateRadarProperty({ [key]: Math.max(bounded, beam.minElevationDeg) });
-    } else {
-      this.updateRadarProperty({ [key]: bounded });
-    }
+    this.updateRadarProperty({ [key]: Math.min(hi, Math.max(lo, v)) });
   }
+
+  // -------------------------------------------------------------------
+  // Beam angle and auto scan
+  // -------------------------------------------------------------------
+
+  nudgeElevation(deltaDeg: number): void {
+    this.onBeamChange('beamElevationDeg', '' + this.roundAngle(this.beam().elevationDeg + deltaDeg));
+  }
+
+  /** Lowest angle (rounded up to 0.1 deg) at which the whole beam width is clear. */
+  protected clearAngle(scan: BeamScanResult): number {
+    return Math.ceil((scan.allClearDeg + 0.01) * 10) / 10;
+  }
+
+  /**
+   * True once the beam has been raised to the all-clear angle (by Auto scan or
+   * by hand). The angle is only shown from then on, never in advance.
+   */
+  protected reachedClear(scan: BeamScanResult): boolean {
+    return scan.sectors.length === 0 && this.beam().elevationDeg >= this.clearAngle(scan) - 0.05;
+  }
+
+  toggleScan(): void {
+    if (this.scanRunning()) {
+      this.stopScan();
+      return;
+    }
+    const entity = this.editorState.selectedEntity();
+    if (!entity || entity.definition.entityType !== 'RadarSite') return;
+
+    // Already at the top (or already all clear): start again from the ground.
+    const scan = this.scan();
+    const current = this.beam().elevationDeg;
+    const top = this.scanStopWhenClear() && scan ? this.clearAngle(scan) : CesiumMap.SCAN_MAX_DEG;
+    if (current >= top) this.updateRadarProperty({ beamElevationDeg: 0 });
+
+    this.scanEntityId = entity.id;
+    this.scanRunning.set(true);
+    this.restartScanTimer();
+  }
+
+  setScanSpeed(ms: number): void {
+    this.scanIntervalMs.set(ms);
+    if (this.scanRunning()) this.restartScanTimer();
+  }
+
+  private restartScanTimer(): void {
+    clearInterval(this.scanTimer);
+    this.scanTimer = setInterval(() => this.scanTick(), this.scanIntervalMs());
+  }
+
+  private scanTick(): void {
+    const id = this.scanEntityId;
+    const entity = id ? this.entityRepository.all().find(e => e.id === id) : undefined;
+    if (!entity) {
+      this.stopScan();
+      return;
+    }
+    const current = CesiumRadarCoverage.beamOf((entity.definition.properties as any) ?? {}).elevationDeg;
+    const scan = this.scans()[entity.id];
+    // The clear angle depends only on the terrain, so the scan knows where to
+    // stop even while the newest angle is still being drawn.
+    const top = this.scanStopWhenClear() && scan ? this.clearAngle(scan) : CesiumMap.SCAN_MAX_DEG;
+    const next = this.roundAngle(Math.min(top, current + this.scanStepDeg()));
+    if (next !== current) this.updateRadarProperty({ beamElevationDeg: next });
+    if (next >= top) this.stopScan();
+  }
+
+  stopScan(): void {
+    clearInterval(this.scanTimer);
+    this.scanTimer = undefined;
+    this.scanEntityId = null;
+    this.scanRunning.set(false);
+  }
+
+  private roundAngle(deg: number): number {
+    return Math.round(deg * 100) / 100;
+  }
+
+  protected formatSector(sector: BlockedSector): string {
+    return CesiumRadarCoverage.formatSector(sector);
+  }
+
+  // Horizon profile chart: lowest clear angle in every direction, with the
+  // beam's angle across it. Bars above the beam line are blocked directions.
+  protected readonly chart = computed(() => {
+    const scan = this.scan();
+    if (!scan || scan.horizon.length === 0) return null;
+    const W = 300, H = 120, left = 30, right = 6, top = 8, bottom = 18;
+    const plotW = W - left - right, plotH = H - top - bottom;
+    const elevation = this.beam().elevationDeg;
+    const values = scan.horizon.map(h => h.clearDeg);
+    const yMin = Math.max(-10, Math.floor(Math.min(-1, elevation, ...values)));
+    const yMax = Math.ceil(Math.max(1, elevation, scan.allClearDeg)) + 1;
+    const y = (deg: number) => top + plotH * (1 - (Math.min(yMax, Math.max(yMin, deg)) - yMin) / (yMax - yMin));
+    const barW = plotW / scan.horizon.length;
+    const bars = scan.horizon.map((h, i) => {
+      const bearing = ((h.azDeg % 360) + 360) % 360;
+      return {
+        x: left + i * barW,
+        y: y(h.clearDeg),
+        w: barW + 0.3,
+        h: Math.max(0, y(yMin) - y(h.clearDeg)),
+        blocked: h.clearDeg >= elevation,
+        title: `Bearing ${bearing.toFixed(0)}° (${CesiumRadarCoverage.compassOf(bearing)}): ` +
+          `clear above ${h.clearDeg.toFixed(1)}°`
+      };
+    });
+    const xTicks: { x: number; label: string }[] = [];
+    for (let a = Math.ceil(scan.startDeg / 90) * 90; a <= scan.startDeg + scan.widthDeg; a += 90) {
+      xTicks.push({ x: left + (plotW * (a - scan.startDeg)) / scan.widthDeg, label: CesiumRadarCoverage.compassOf(a) });
+    }
+    if (scan.widthDeg >= 360) xTicks.pop();
+    return {
+      W, H, left, right: W - right, top, bottom: H - bottom, bars, xTicks,
+      // Top, 0° and bottom, skipping any too close to another to read.
+      yTicks: [yMax, 0, yMin].filter((v, i, all) => all.indexOf(v) === i)
+        .map(v => ({ y: y(v), label: `${v}°` }))
+        .filter((t, i, all) => all.slice(0, i).every(o => Math.abs(o.y - t.y) >= 14)),
+      beamY: y(elevation)
+    };
+  });
 
   onStyleChange(patch: Partial<RadarStyle>): void {
     this.updateRadarProperty(patch);
@@ -524,10 +674,6 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
   clearLosProbe(): void {
     this.losProbe?.clear();
     this.losProbeResult.set(null);
-  }
-
-  onShowBlockedPointsChange(checked: boolean): void {
-    this.updateRadarProperty({ showBlockedPoints: checked });
   }
 
   refreshRadarCoverage(): void {
@@ -748,6 +894,8 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
 
 
   ngOnDestroy(): void {
+
+    this.stopScan();
 
     this.viewer.destroy();
 

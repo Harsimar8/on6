@@ -43,26 +43,135 @@
       </div>
     </div>
 
+    @if (building()) {
+      <div class="panel-busy" role="status"><span class="spinner"></span>Updating radar beam…</div>
+    }
+
     <div class="radar-panel__body">
 
       <section class="radar-section">
-        <h4 class="radar-section__title">Beam</h4>
+        <h4 class="radar-section__title">Beam Angle</h4>
 
         <div class="beam-control">
           <div class="beam-control__header">
-            <span>Direction</span>
+            <span>Elevation (0° = level)</span>
             <div class="beam-value">
-              <input class="beam-number" type="number" min="0" max="359" step="1"
-                [value]="beam().azimuthDeg"
-                (change)="onBeamChange('beamAzimuthDeg', $any($event.target).value)">
+              <input class="beam-number" type="number" min="-5" max="45" step="0.1"
+                [value]="beam().elevationDeg"
+                (change)="onBeamChange('beamElevationDeg', $any($event.target).value)">
               <em>°</em>
             </div>
           </div>
-          <input class="beam-slider" type="range" min="0" max="359" step="1"
-            [value]="beam().azimuthDeg"
-            (change)="onBeamChange('beamAzimuthDeg', $any($event.target).value)">
-          <div class="beam-control__range"><span>N 0°</span><span>359°</span></div>
+          <div class="angle-row">
+            <button class="angle-btn" title="Lower 0.5°" (click)="nudgeElevation(-0.5)">−</button>
+            <input class="beam-slider" type="range" min="-5" max="45" step="0.1"
+              [value]="beam().elevationDeg"
+              (input)="onBeamChange('beamElevationDeg', $any($event.target).value)">
+            <button class="angle-btn" title="Raise 0.5°" (click)="nudgeElevation(0.5)">+</button>
+          </div>
+          <div class="beam-control__range"><span>-5°</span><span>45°</span></div>
+          @if (scan(); as s) {
+            @if (reachedClear(s)) {
+              <div class="clear-badge clear-badge--ok">✓ All clear at {{ clearAngle(s) | number:'1.1-1' }}° — every direction reaches full range</div>
+            }
+          }
         </div>
+
+        <div class="view-toggle" role="group" aria-label="Which angles to show">
+          <button class="chip" [class.active]="!radarStyle().showLowerBeams"
+            (click)="onStyleChange({ showLowerBeams: false })"
+            title="Show only the sheet at the beam angle">Only this angle</button>
+          <button class="chip" [class.active]="radarStyle().showLowerBeams"
+            (click)="onStyleChange({ showLowerBeams: true })"
+            title="Also show every lower angle from 0° up to the beam">0° up to this angle</button>
+        </div>
+
+        <div class="scan-box">
+          <div class="scan-box__row">
+            <button class="scan-btn" [class.scan-btn--running]="scanRunning()" (click)="toggleScan()">
+              {{ scanRunning() ? '■ Stop scan' : '▲ Auto scan up' }}
+            </button>
+          </div>
+          <div class="scan-box__row">
+            <span class="scan-box__label">Step</span>
+            @for (step of scanStepOptions; track step) {
+              <button class="chip" [class.active]="scanStepDeg() === step" (click)="scanStepDeg.set(step)">{{ step }}°</button>
+            }
+          </div>
+          <div class="scan-box__row">
+            <span class="scan-box__label">Speed</span>
+            @for (speed of scanSpeedOptions; track speed.ms) {
+              <button class="chip" [class.active]="scanIntervalMs() === speed.ms" (click)="setScanSpeed(speed.ms)">{{ speed.label }}</button>
+            }
+          </div>
+          <label class="checkbox-field">
+            <input type="checkbox" [checked]="scanStopWhenClear()"
+              (change)="scanStopWhenClear.set($any($event.target).checked)">
+            <span>Stop when every direction is clear</span>
+          </label>
+        </div>
+
+        @if (scan(); as s) {
+          <div class="scan-summary" [attr.data-clear]="s.sectors.length === 0">
+            <div class="scan-summary__headline">
+              @if (s.sectors.length === 0) {
+                ✓ Clear in every direction at {{ s.elevationDeg | number:'1.1-2' }}°
+              } @else {
+                ⚠ Blocked in {{ 100 - s.clearPct | number:'1.0-0' }}% of directions at {{ s.elevationDeg | number:'1.1-2' }}°
+              }
+            </div>
+            @if (reachedClear(s)) {
+              <div class="scan-summary__sub">
+                Found: from <strong>{{ clearAngle(s) | number:'1.1-1' }}°</strong> up the whole beam width clears the
+                terrain — aircraft on the beam are seen out to {{ s.range / 1000 | number:'1.0-1' }} km.
+              </div>
+            } @else {
+              <div class="scan-summary__sub">Raise the angle (or Auto scan) to find where every direction clears.</div>
+            }
+          </div>
+
+          @if (chart(); as c) {
+            <figure class="horizon-chart">
+              <figcaption>Lowest clear angle by direction</figcaption>
+              <svg [attr.viewBox]="'0 0 ' + c.W + ' ' + c.H" role="img"
+                aria-label="Lowest angle that clears the terrain in each direction, with the beam angle">
+                @for (t of c.yTicks; track t.label) {
+                  <line class="hc-grid" [attr.x1]="c.left" [attr.x2]="c.right" [attr.y1]="t.y" [attr.y2]="t.y" />
+                  <text class="hc-axis" [attr.x]="c.left - 4" [attr.y]="t.y + 3" text-anchor="end">{{ t.label }}</text>
+                }
+                @for (b of c.bars; track $index) {
+                  <rect [attr.x]="b.x" [attr.y]="b.y" [attr.width]="b.w" [attr.height]="b.h"
+                    [class.hc-bar--blocked]="b.blocked" class="hc-bar"><title>{{ b.title }}</title></rect>
+                }
+                <line class="hc-beam" [attr.x1]="c.left" [attr.x2]="c.right" [attr.y1]="c.beamY" [attr.y2]="c.beamY" />
+                @for (t of c.xTicks; track t.x) {
+                  <text class="hc-axis" [attr.x]="t.x" [attr.y]="c.bottom + 13" text-anchor="middle">{{ t.label }}</text>
+                }
+              </svg>
+              <div class="shadow-legend">
+                <span class="shadow-legend__item"><span class="swatch swatch--line-beam"></span>Beam angle</span>
+                <span class="shadow-legend__item"><span class="swatch swatch--blocked"></span>Blocked direction</span>
+              </div>
+            </figure>
+          }
+
+          @if (s.sectors.length > 0) {
+            <div class="sector-list">
+              <div class="sector-list__head"><span>Blocked direction</span><span>Hits at</span><span>Clears at</span></div>
+              @for (sector of s.sectors; track $index) {
+                <div class="sector-list__row">
+                  <span>{{ formatSector(sector) }}</span>
+                  <span>{{ sector.nearestHitM / 1000 | number:'1.1-1' }} km</span>
+                  <span>{{ sector.clearDeg | number:'1.1-1' }}°</span>
+                </div>
+              }
+            </div>
+          }
+        }
+      </section>
+
+      <section class="radar-section">
+        <h4 class="radar-section__title">Beam</h4>
 
         <div class="beam-control">
           <div class="beam-control__header">
@@ -80,6 +189,7 @@
           <div class="beam-control__range"><span>Narrow</span><span>All round</span></div>
         </div>
 
+        <div class="zone-card__hint">Pick a width, or type any width from 1° to 360° above.</div>
         <div class="beam-presets">
           @for (w of beamWidthPresets; track w) {
             <button class="beam-preset" [class.active]="beam().widthDeg === w"
@@ -87,41 +197,23 @@
           }
         </div>
 
-        <div class="beam-control">
-          <div class="beam-control__header">
-            <span>Min Angle (bottom of beam)</span>
-            <div class="beam-value">
-              <input class="beam-number" type="number" min="-10" max="90" step="0.5"
-                [max]="beam().maxElevationDeg"
-                [value]="beam().minElevationDeg"
-                (change)="onBeamChange('beamMinElevationDeg', $any($event.target).value)">
-              <em>°</em>
+        @if (beam().widthDeg < 360) {
+          <div class="beam-control">
+            <div class="beam-control__header">
+              <span>Direction</span>
+              <div class="beam-value">
+                <input class="beam-number" type="number" min="0" max="359" step="1"
+                  [value]="beam().azimuthDeg"
+                  (change)="onBeamChange('beamAzimuthDeg', $any($event.target).value)">
+                <em>°</em>
+              </div>
             </div>
+            <input class="beam-slider" type="range" min="0" max="359" step="1"
+              [value]="beam().azimuthDeg"
+              (change)="onBeamChange('beamAzimuthDeg', $any($event.target).value)">
+            <div class="beam-control__range"><span>N 0°</span><span>359°</span></div>
           </div>
-          <input class="beam-slider" type="range" min="-10" max="90" step="0.5"
-            [max]="beam().maxElevationDeg"
-            [value]="beam().minElevationDeg"
-            (input)="onBeamChange('beamMinElevationDeg', $any($event.target).value)">
-          <div class="beam-control__range"><span>-10°</span><span>90°</span></div>
-        </div>
-
-        <div class="beam-control">
-          <div class="beam-control__header">
-            <span>Max Angle (top of beam)</span>
-            <div class="beam-value">
-              <input class="beam-number" type="number" min="-10" max="90" step="0.5"
-                [min]="beam().minElevationDeg"
-                [value]="beam().maxElevationDeg"
-                (change)="onBeamChange('beamMaxElevationDeg', $any($event.target).value)">
-              <em>°</em>
-            </div>
-          </div>
-          <input class="beam-slider" type="range" min="-10" max="90" step="0.5"
-            [min]="beam().minElevationDeg"
-            [value]="beam().maxElevationDeg"
-            (input)="onBeamChange('beamMaxElevationDeg', $any($event.target).value)">
-          <div class="beam-control__range"><span>-10°</span><span>90°</span></div>
-        </div>
+        }
 
         <div class="beam-control">
           <div class="beam-control__header">
@@ -145,28 +237,15 @@
             [value]="beam().mastHeight"
             (change)="onElevationChange($any($event.target).value)">
         </label>
-
-        <label class="field">
-          <span>Aircraft Height Above Ground (m)</span>
-          <input type="number" min="0" step="10"
-            [value]="beam().targetHeightAgl"
-            (change)="onTargetHeightChange($any($event.target).value)">
-        </label>
-
-        <div class="zone-card__hint">
-          The beam spans the full width and the min-to-max elevation angles. Raise the min angle to lift
-          its bottom edge, or raise the max angle to lift its top edge. Terrain blocks each direction
-          independently; use Explain Blocking to see the minimum height and angle needed to clear a ridge.
-        </div>
       </section>
 
       <section class="radar-section">
         <h4 class="radar-section__title">Display</h4>
 
         <div class="shadow-legend">
-          <span class="shadow-legend__item"><span class="swatch swatch--lit"></span>Beam lands on ground</span>
+          <span class="shadow-legend__item"><span class="swatch swatch--lit"></span>Beam reaches full range</span>
+          <span class="shadow-legend__item"><span class="swatch swatch--shadow"></span>Hidden ground (footprint)</span>
           <span class="shadow-legend__item"><span class="swatch swatch--blocked"></span>Blocked by terrain</span>
-          <span class="shadow-legend__item"><span class="swatch swatch--ray"></span>Ray hits terrain</span>
         </div>
 
         <label class="checkbox-field">
@@ -187,41 +266,16 @@
           <div class="beam-control__range"><span>Transparent</span><span>Solid</span></div>
         </div>
 
-        <div class="beam-control">
-          <div class="beam-control__header">
-            <span>Terrain-hit Wall Opacity</span>
-            <strong>{{ radarStyle().hitWallOpacity * 100 | number:'1.0-0' }}%</strong>
-          </div>
-          <input class="beam-slider" type="range" min="0" max="1" step="0.01"
-            [value]="radarStyle().hitWallOpacity"
-            (input)="onStyleChange({ hitWallOpacity: +$any($event.target).value })">
-          <div class="beam-control__range"><span>Hidden</span><span>Solid</span></div>
-        </div>
-
-        <div class="beam-control">
-          <div class="beam-control__header">
-            <span>Beam Wall Detail</span>
-            <strong>{{ beam().wallDetailDeg | number:'1.1-1' }}°</strong>
-          </div>
-          <input class="beam-slider" type="range" min="0.5" max="5" step="0.5"
-            [value]="beam().wallDetailDeg"
-            (change)="onBeamChange('beamWallDetailDeg', $any($event.target).value)">
-          <div class="beam-control__range"><span>Fine</span><span>Coarse</span></div>
-          <small class="zone-card__hint">
-            Coarser detail smooths the beam mesh; ground-footprint masking keeps its full detail.
-          </small>
-        </div>
-
         <label class="checkbox-field">
           <input type="checkbox"
             [checked]="radarStyle().showBlocked"
             (change)="onStyleChange({ showBlocked: $any($event.target).checked })">
-          <span>Show Ground Footprint (green / dark)</span>
+          <span>Show Blocked Ground (red)</span>
         </label>
 
         <div class="beam-control">
           <div class="beam-control__header">
-            <span>Footprint Opacity</span>
+            <span>Blocked Ground Opacity</span>
             <strong>{{ radarStyle().blockedOpacity * 100 | number:'1.0-0' }}%</strong>
           </div>
           <input class="beam-slider" type="range" min="0" max="1" step="0.01"
@@ -232,37 +286,52 @@
 
         <label class="checkbox-field">
           <input type="checkbox"
-            [checked]="radarStyle().showRays"
-            (change)="onStyleChange({ showRays: $any($event.target).checked })">
-          <span>Show Rays (min to max angle)</span>
+            [checked]="radarStyle().showFootprint"
+            (change)="onStyleChange({ showFootprint: $any($event.target).checked })">
+          <span>Show Ground Footprint (green = radar sees the ground, dark = hidden)</span>
         </label>
 
-        <div class="zone-card__fields">
+        @if (radarStyle().showFootprint) {
+          <div class="beam-control">
+            <div class="beam-control__header">
+              <span>Footprint Opacity</span>
+              <strong>{{ radarStyle().footprintOpacity * 100 | number:'1.0-0' }}%</strong>
+            </div>
+            <input class="beam-slider" type="range" min="0" max="1" step="0.01"
+              [value]="radarStyle().footprintOpacity"
+              (input)="onStyleChange({ footprintOpacity: +$any($event.target).value })">
+            <div class="beam-control__range"><span>Transparent</span><span>Solid</span></div>
+          </div>
+        }
+
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="radarStyle().showLabels"
+            (change)="onStyleChange({ showLabels: $any($event.target).checked })">
+          <span>Label Blocked Directions on Map</span>
+        </label>
+
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="radarStyle().showRays"
+            (change)="onStyleChange({ showRays: $any($event.target).checked })">
+          <span>Show Rays</span>
+        </label>
+
+        @if (radarStyle().showRays) {
           <label class="field">
             <span>RAYS ACROSS</span>
             <input type="number" min="1" max="180" step="1"
               [value]="beam().raysAcross"
               (change)="onBeamChange('raysAcross', $any($event.target).value)">
           </label>
-          <label class="field">
-            <span>RAYS UP</span>
-            <input type="number" min="1" max="60" step="1"
-              [value]="beam().raysUp"
-              (change)="onBeamChange('raysUp', $any($event.target).value)">
-          </label>
-        </div>
+        }
 
         <div class="zone-card__hint">
-          Each ray stops where it meets the terrain (orange dot). Rays that never meet it run to the full range.
-          The beam's walls join the tips of all its rays (one every 0.25° up, up to 240 directions across).
+          The beam is one sheet at the elevation angle, in every direction of the beam width. Where it meets
+          a hill it stops (red edge); the ground behind is shaded red. Raise the angle (or run Auto scan)
+          until every direction is green to find the lowest angle aircraft can be seen at.
         </div>
-
-        <label class="checkbox-field">
-          <input type="checkbox"
-            [checked]="getRadarProp('showBlockedPoints', false)"
-            (change)="onShowBlockedPointsChange($any($event.target).checked)">
-          <span>Mark Blocking Ridges</span>
-        </label>
       </section>
 
       <section class="radar-section">
@@ -351,6 +420,10 @@
     }
 
   </div>
+
+  @if (anyBuilding()) {
+    <div class="map-busy" role="status"><span class="spinner"></span>Updating radar beam…</div>
+  }
 
   <div #cesiumContainer class="map">
   </div>
