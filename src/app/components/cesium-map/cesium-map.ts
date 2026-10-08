@@ -517,8 +517,7 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
     beamAzimuthDeg: [0, 359.9],
     beamWidthDeg: [1, 360],
     beamElevationDeg: [-5, CesiumMap.SCAN_MAX_DEG],
-    beamRange: [500, 100000],
-    raysAcross: [1, 180]
+    beamRange: [500, 100000]
   };
 
   onBeamChange(key: string, value: string): void {

@@ -28,23 +28,29 @@ export interface BeamSettings {
     targetHeightAgl: number;
     // Antenna height above the ground it stands on.
     mastHeight: number;
-    // Rays drawn across the beam.
-    raysAcross: number;
 }
 
 // Settings that only change how the coverage looks. Applied in place through
 // RadarCoverageHandle.setStyle, without re-sampling terrain or rebuilding.
 export interface RadarStyle {
+    // "Only this angle" mode: showReach shows the part of the beam that clears
+    // the terrain (green), showBlocked the part stopped by it (red).
     beamOpacity: number;
     showBeam: boolean;
-    // Ground behind the terrain that stops the beam.
-    blockedOpacity: number;
+    showReach: boolean;
     showBlocked: boolean;
-    showRays: boolean;
     showLabels: boolean;
     // Also show every lower angle from 0° up to the beam (a solid fan), not
     // just the sheet at the beam's own angle.
     showLowerBeams: boolean;
+    // "0° up to this angle" mode: shade the solid figure by the light, and
+    // draw it see-through (else opaque).
+    volumeLit: boolean;
+    volumeTransparent: boolean;
+    // How strong the light shading is (0 = none, 1 = strongest), and how
+    // opaque the figure is when drawn see-through (0-1).
+    volumeLight: number;
+    volumeOpacity: number;
     // Ground footprint: green where the radar sees the ground, dark where
     // terrain hides it (the same at every beam angle).
     showFootprint: boolean;
@@ -158,7 +164,7 @@ export const DEFAULT_TARGET_HEIGHT_AGL_M = 0;
 // horizon up by degrees and throws long false shadows.
 export const DEFAULT_MAST_HEIGHT_M = 10;
 
-export const DEFAULT_BEAM: Omit<BeamSettings, "targetHeightAgl" | "mastHeight" | "raysAcross"> = {
+export const DEFAULT_BEAM: Omit<BeamSettings, "targetHeightAgl" | "mastHeight"> = {
     azimuthDeg: 0,
     widthDeg: 360,
     range: 20000,
@@ -168,11 +174,14 @@ export const DEFAULT_BEAM: Omit<BeamSettings, "targetHeightAgl" | "mastHeight" |
 export const DEFAULT_RADAR_STYLE: RadarStyle = {
     beamOpacity: 0.25,
     showBeam: true,
-    blockedOpacity: 0.5,
+    showReach: true,
     showBlocked: true,
-    showRays: false,
     showLabels: true,
     showLowerBeams: false,
+    volumeLit: true,
+    volumeTransparent: true,
+    volumeLight: 0.65,
+    volumeOpacity: 0.45,
     showFootprint: false,
     footprintOpacity: 0.45
 };
@@ -183,12 +192,6 @@ const SEEN_RGB = [34, 197, 94];        // #22c55e  footprint: ground the radar s
 const HIDDEN_RGB = [31, 41, 55];       // #1f2937  footprint: ground hidden by terrain
 const CLEAR_COLOR = Cesium.Color.fromBytes(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2]);
 const BLOCKED_COLOR = Cesium.Color.fromBytes(BLOCKED_RGB[0], BLOCKED_RGB[1], BLOCKED_RGB[2]);
-const HIT_LINE_COLOR = Cesium.Color.fromCssColorString("#7f1d1d");
-// Green ground under the beam is drawn this much fainter than the red, so
-// the blocked areas stand out.
-const REACH_ALPHA = 0.55;
-const RAY_HIT_COLOR = Cesium.Color.fromCssColorString("#f59e0b");   // ray stopped by terrain
-const RAY_CLEAR_COLOR = Cesium.Color.fromCssColorString("#bbf7d0"); // ray reaches full range
 
 // World terrain is ~30 m detail in most mountain areas; sampling finer than
 // this costs time without adding real accuracy.
@@ -226,6 +229,9 @@ const LOWER_BEAMS_FLOOR_DEG = 0;
 const LOWER_LEVEL_STEP_DEG = 0.25;
 const LOWER_MAX_LEVELS = 120;
 const LOWER_FLOOR_ALPHA = 0.5;
+// Shading of the lit figure: how high above the horizon the light is
+// (relative weight).
+const SHADE_LIGHT_UP = 0.5;
 const LOWER_WALL_ALPHA = 1.2;
 // Blocked sectors separated by a clear gap narrower than this are one sector
 // in the panel list and map labels (the map shading keeps every gap).
@@ -244,13 +250,6 @@ const FOOTPRINT_TEXTURE_MAX_PX = 1024;
 const FOOTPRINT_CACHE_SIZE = 4;
 // Footprint visibility score is clamped to +-this (metres), so edges blend.
 const FOOTPRINT_SCORE_CLAMP_M = 25;
-// Range arc of the shading: one point every this many degrees.
-const ARC_STEP_DEG = 1;
-const MAX_RAYS_ACROSS = 180;
-const RAY_LINE_POINTS = 16;
-// Drawn rays across the beam when not set: one every this many degrees.
-const DEFAULT_RAY_SPACING_DEG = 5;
-const HIT_POINT_ALWAYS_VISIBLE_M = 3000;
 
 // =============================================================================
 // CesiumRadarCoverage: one beam at one angle, cut by terrain
@@ -283,9 +282,7 @@ export class CesiumRadarCoverage {
             range: props["beamRange"] ?? props["zoneRanges"]?.["Coverage Zone"] ?? DEFAULT_BEAM.range,
             elevationDeg: props["beamElevationDeg"] ?? DEFAULT_BEAM.elevationDeg,
             targetHeightAgl: props["targetHeightAgl"] ?? DEFAULT_TARGET_HEIGHT_AGL_M,
-            mastHeight: props["antennaMastHeight"] ?? DEFAULT_MAST_HEIGHT_M,
-            raysAcross: props["raysAcross"] ?? Cesium.Math.clamp(
-                Math.round(widthDeg / DEFAULT_RAY_SPACING_DEG) + (widthDeg >= 360 ? 0 : 1), 3, MAX_RAYS_ACROSS)
+            mastHeight: props["antennaMastHeight"] ?? DEFAULT_MAST_HEIGHT_M
         };
     }
 
@@ -293,11 +290,14 @@ export class CesiumRadarCoverage {
         return {
             beamOpacity: props["beamOpacity"] ?? DEFAULT_RADAR_STYLE.beamOpacity,
             showBeam: props["showBeam"] ?? DEFAULT_RADAR_STYLE.showBeam,
-            blockedOpacity: props["blockedOpacity"] ?? DEFAULT_RADAR_STYLE.blockedOpacity,
+            showReach: props["showReach"] ?? DEFAULT_RADAR_STYLE.showReach,
             showBlocked: props["showBlocked"] ?? DEFAULT_RADAR_STYLE.showBlocked,
-            showRays: props["showRays"] ?? DEFAULT_RADAR_STYLE.showRays,
             showLabels: props["showLabels"] ?? DEFAULT_RADAR_STYLE.showLabels,
             showLowerBeams: props["showLowerBeams"] ?? DEFAULT_RADAR_STYLE.showLowerBeams,
+            volumeLit: props["volumeLit"] ?? DEFAULT_RADAR_STYLE.volumeLit,
+            volumeTransparent: props["volumeTransparent"] ?? DEFAULT_RADAR_STYLE.volumeTransparent,
+            volumeLight: props["volumeLight"] ?? DEFAULT_RADAR_STYLE.volumeLight,
+            volumeOpacity: props["volumeOpacity"] ?? DEFAULT_RADAR_STYLE.volumeOpacity,
             showFootprint: props["showFootprint"] ?? DEFAULT_RADAR_STYLE.showFootprint,
             footprintOpacity: props["footprintOpacity"] ?? DEFAULT_RADAR_STYLE.footprintOpacity
         };
@@ -432,27 +432,21 @@ export class CesiumRadarCoverage {
         const runs = CesiumRadarCoverage.blockedRuns(tips.hit, wrap);
         const scan = CesiumRadarCoverage.summarise(grid, tips, runs, elevationDeg);
 
+
         const beam = CesiumRadarCoverage.buildBeam(viewer, entityId, grid, tips, radarHeight, angle, lastCol);
         const lower = CesiumRadarCoverage.buildLowerBeams(
             viewer, entityId, grid, radarHeight, Math.min(LOWER_BEAMS_FLOOR_DEG, elevationDeg), elevationDeg, lastCol);
-        const blocked = CesiumRadarCoverage.buildBlockedArea(viewer, entityId, grid, tips, runs, lastCol);
         const footprint = CesiumRadarCoverage.buildFootprint(
             viewer, entityId, grid, longitude, latitude,
             `${longitude}|${latitude}|${radarHeight}|${zone.azimuthStartDeg}|${widthDeg}|${zone.range}|${rows}`);
         const labels = CesiumRadarCoverage.buildSectorLabels(viewer, entityId, grid, tips, scan.sectors, lastCol);
-        const rayFan = CesiumRadarCoverage.buildRays(
-            viewer, grid, radarHeight, angle,
-            Math.round(Cesium.Math.clamp(options.beam.raysAcross, 1, MAX_RAYS_ACROSS))
-        );
-        handles.push(beam, lower, blocked, footprint, labels, rayFan);
+        handles.push(beam, lower, footprint, labels);
 
         const applyStyle = (st: RadarStyle) => {
             beam.setStyle(st);
             lower.setStyle(st);
-            blocked.setStyle(st);
             footprint.setStyle(st);
             labels.setStyle(st);
-            rayFan.setStyle(st);
             viewer.scene.requestRender();
         };
         applyStyle(options.style);
@@ -521,13 +515,6 @@ export class CesiumRadarCoverage {
             lat: pts[i0].latitude + (pts[i1].latitude - pts[i0].latitude) * u,
             height: heights[i0] + (heights[i1] - heights[i0]) * u
         };
-    }
-
-    // Ground-level point at this azimuth and horizontal distance (for draped shapes).
-    private static planePoint(grid: RayGrid, azDeg: number, d: number): Cesium.Cartesian3 {
-        const az = Cesium.Math.toRadians(azDeg);
-        return Cesium.Matrix4.multiplyByPoint(
-            grid.enuMatrix, new Cesium.Cartesian3(Math.sin(az) * d, Math.cos(az) * d, 0), new Cesium.Cartesian3());
     }
 
     // -------------------------------------------------------------------
@@ -664,29 +651,32 @@ export class CesiumRadarCoverage {
         };
 
         const positions = new Float64Array(R * C * 3);
-        const blockedVertex = new Uint8Array(R * C);
         for (let k = 0; k < R; k++) {
             const row = rowIdx[k];
             for (let j = 0; j < C; j++) {
                 const p = rayPoint(row, (tips.dist[row] * j) / (C - 1));
                 positions.set([p.x, p.y, p.z], (k * C + j) * 3);
-                blockedVertex[k * C + j] = tips.hit[row];
             }
         }
-        const indices: number[] = [];
+        // Two surfaces: directions where the beam clears the terrain (green)
+        // and directions stopped by it (red), switched on and off separately.
+        // The strip between two directions goes with the first of them.
+        const clearIndices: number[] = [];
+        const blockedIndices: number[] = [];
         for (let k = 0; k < (wrap ? R : R - 1); k++) {
             const k2 = (k + 1) % R;
+            const target = tips.hit[rowIdx[k]] ? blockedIndices : clearIndices;
             for (let j = 0; j < C - 1; j++) {
                 const p00 = k * C + j, p01 = p00 + 1, p10 = k2 * C + j, p11 = p10 + 1;
-                indices.push(p00, p01, p10, p01, p11, p10);
+                target.push(p00, p01, p10, p01, p11, p10);
             }
         }
-        const indexArray = new Uint32Array(indices);
         const boundingSphere = Cesium.BoundingSphere.fromVertices(Array.from(positions));
 
-        // Tip line, split into clear (green, in the air) and blocked (red, on
-        // the terrain) stretches.
+        // Tip line, split into clear (green, in the air: part of the beam) and
+        // blocked (red, on the terrain: part of the blockage layer) stretches.
         const tipLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
+        const hitTipLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         // Every polyline needs its own material: a PolylineCollection destroys
         // each line's material when it is removed, so a shared one would be
         // destroyed twice and throw, leaving the rest of the old beam behind.
@@ -701,7 +691,11 @@ export class CesiumRadarCoverage {
             // Close the line to the next stretch (or back round to the start).
             if (next < R) pts.push(tipOf(rowIdx[next]));
             else if (wrap) pts.push(tipOf(rowIdx[0]));
-            if (pts.length >= 2) tipLines.add({ positions: pts, width: 2.5, material: lineMaterial(state ? BLOCKED_COLOR : CLEAR_COLOR) });
+            if (pts.length >= 2) {
+                (state ? hitTipLines : tipLines).add({
+                    positions: pts, width: 2.5, material: lineMaterial(state ? BLOCKED_COLOR : CLEAR_COLOR)
+                });
+            }
             k = next;
         }
         // Range rings: drawn only over directions the beam reaches that far.
@@ -731,36 +725,46 @@ export class CesiumRadarCoverage {
             }
         }
 
-        const mesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions, indexArray, boundingSphere,
-            v => [blockedVertex[v] ? BLOCKED_RGB : CLEAR_RGB,
-                BEAM_NEAR_ALPHA + (1 - BEAM_NEAR_ALPHA) * ((v % C) / (C - 1))]);
+        const alongAlpha = (v: number) => BEAM_NEAR_ALPHA + (1 - BEAM_NEAR_ALPHA) * ((v % C) / (C - 1));
+        const clearMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
+            new Uint32Array(clearIndices), boundingSphere, v => [CLEAR_RGB, alongAlpha(v)]);
+        const blockedMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
+            new Uint32Array(blockedIndices), boundingSphere, v => [BLOCKED_RGB, alongAlpha(v)]);
 
         return {
             dispose: () => {
-                mesh.dispose();
+                clearMesh.dispose();
+                blockedMesh.dispose();
                 viewer.scene.primitives.remove(tipLines);
+                viewer.scene.primitives.remove(hitTipLines);
             },
+            // "Only this angle" mode: Show green = the part of the beam that
+            // clears the terrain, Show red = the part stopped by it.
             setStyle: (st: RadarStyle) => {
-                mesh.draw(st.showBeam ? Cesium.Math.clamp(st.beamOpacity, 0, 1) : 0);
-                tipLines.show = st.showBeam;
+                const thisAngle = !st.showLowerBeams;
+                const opacity = Cesium.Math.clamp(st.beamOpacity, 0, 1);
+                clearMesh.draw(thisAngle && st.showReach ? opacity : 0, false);
+                blockedMesh.draw(thisAngle && st.showBlocked ? opacity : 0, false);
+                tipLines.show = thisAngle && st.showReach;
+                hitTipLines.show = thisAngle && st.showBlocked;
             }
         };
     }
 
-    // A triangle mesh with a colour per vertex, redrawn when its opacity
-    // changes. colorOf gives each vertex's colour and its alpha relative to
-    // the opacity passed to draw.
+    // A triangle mesh with a colour per vertex, redrawn when its opacity or
+    // red (whether blocked parts are shown red) changes. colorOf gives each
+    // vertex's colour and its alpha relative to the opacity passed to draw.
     private static coloredMesh(
         viewer: Cesium.Viewer,
         entityId: string,
         positions: Float64Array,
         indices: Uint32Array,
         boundingSphere: Cesium.BoundingSphere,
-        colorOf: (v: number) => [number[], number]
-    ): { draw(opacity: number): void; dispose(): void } {
+        colorOf: (v: number, red: boolean) => [number[], number]
+    ): { draw(opacity: number, red: boolean, light?: number): void; dispose(): void } {
         const vertexCount = positions.length / 3;
         let primitive: Cesium.Primitive | null = null;
-        let builtOpacity = -1;
+        let builtKey = "";
         let disposed = false;
         const remove = () => {
             if (primitive) viewer.scene.primitives.remove(primitive);
@@ -771,19 +775,23 @@ export class CesiumRadarCoverage {
                 disposed = true;
                 remove();
             },
-            draw: (opacity: number) => {
-                if (disposed || opacity === builtOpacity) return;
-                builtOpacity = opacity;
+            // lit: shade each face by how it faces a fixed light from above
+            // and to the side, the same on both sides (so the figure is
+            // shaded inside too). opacity 1: fully opaque (no see-through).
+            // light: strength of the shading, 0 = flat (not lit).
+            draw: (opacity: number, red: boolean, light = 0) => {
+                const key = `${opacity}|${red}|${light}`;
+                const solid = opacity >= 1;
+                if (disposed || key === builtKey) return;
+                builtKey = key;
                 remove();
                 if (indices.length === 0 || opacity <= 0) return;
                 const colors = new Uint8Array(vertexCount * 4);
                 for (let v = 0; v < vertexCount; v++) {
-                    const [rgb, alpha] = colorOf(v);
-                    colors.set([rgb[0], rgb[1], rgb[2], Math.round(255 * Math.min(1, opacity * alpha))], v * 4);
+                    const [rgb, alpha] = colorOf(v, red);
+                    colors.set([rgb[0], rgb[1], rgb[2], solid ? 255 : Math.round(255 * Math.min(1, opacity * alpha))], v * 4);
                 }
-                primitive = viewer.scene.primitives.add(new Cesium.Primitive({
-                    geometryInstances: new Cesium.GeometryInstance({
-                        geometry: new Cesium.Geometry({
+                const geometry = new Cesium.Geometry({
                             attributes: {
                                 position: new Cesium.GeometryAttribute({
                                     componentDatatype: Cesium.ComponentDatatype.DOUBLE,
@@ -801,14 +809,46 @@ export class CesiumRadarCoverage {
                             indices,
                             primitiveType: Cesium.PrimitiveType.TRIANGLES,
                             boundingSphere
-                        })
-                    }),
-                    appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: true, closed: false }),
+                        });
+                if (light > 0) CesiumRadarCoverage.shadeColors(geometry, colors, boundingSphere.center, light);
+                primitive = viewer.scene.primitives.add(new Cesium.Primitive({
+                    geometryInstances: new Cesium.GeometryInstance({ geometry }),
+                    appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: !solid, closed: false }),
                     asynchronous: false
                 })) as Cesium.Primitive;
                 (primitive as any).radarParentId = entityId;
             }
         };
+    }
+
+    // Darkens or brightens each vertex colour by how its face turns to a
+    // fixed light (above the radar, a little to the south-east). Uses the
+    // absolute angle, so both sides of a face are lit alike.
+    private static shadeColors(geometry: Cesium.Geometry, colors: Uint8Array, center: Cesium.Cartesian3, strength: number): void {
+        Cesium.GeometryPipeline.computeNormal(geometry);
+        const normals = (geometry.attributes as any).normal.values as Float32Array;
+        delete (geometry.attributes as any).normal;
+
+        const up = Cesium.Cartesian3.normalize(center, new Cesium.Cartesian3());
+        const east = Cesium.Cartesian3.normalize(
+            Cesium.Cartesian3.cross(Cesium.Cartesian3.UNIT_Z, up, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+        const north = Cesium.Cartesian3.cross(up, east, new Cesium.Cartesian3());
+        const light = new Cesium.Cartesian3();
+        Cesium.Cartesian3.add(
+            Cesium.Cartesian3.multiplyByScalar(up, SHADE_LIGHT_UP, new Cesium.Cartesian3()),
+            Cesium.Cartesian3.add(
+                Cesium.Cartesian3.multiplyByScalar(east, 0.6, new Cesium.Cartesian3()),
+                Cesium.Cartesian3.multiplyByScalar(north, -0.45, new Cesium.Cartesian3()),
+                new Cesium.Cartesian3()),
+            light);
+        Cesium.Cartesian3.normalize(light, light);
+
+        for (let v = 0; v < colors.length / 4; v++) {
+            const dot = Math.abs(normals[v * 3] * light.x + normals[v * 3 + 1] * light.y + normals[v * 3 + 2] * light.z);
+            // A face turned away keeps (1 - strength) of its colour.
+            const f = 1 - strength + strength * (Number.isFinite(dot) ? dot : 1);
+            for (let c = 0; c < 3; c++) colors[v * 4 + c] = Math.min(255, Math.round(colors[v * 4 + c] * f));
+        }
     }
 
     // -------------------------------------------------------------------
@@ -884,14 +924,20 @@ export class CesiumRadarCoverage {
                 }
             }
         };
-        const tipColor = (r: number, k: number): [number[], number] =>
-            [hit[r * M + k] ? BLOCKED_RGB : CLEAR_RGB, LOWER_WALL_ALPHA];
+        // Wall vertices that are ray tips on the terrain (red with the
+        // blockage layer on).
+        const wallHit: boolean[] = [];
 
-        // Floor sheet.
-        addGrid(R, C, wrap, (r, j) => along(r, 0, j),
-            r => [hit[r * M] ? BLOCKED_RGB : CLEAR_RGB, LOWER_FLOOR_ALPHA]);
+        // Floor sheet (0°) and top sheet (the beam's angle).
+        addGrid(R, C, wrap, (r, j) => along(r, 0, j), () => [CLEAR_RGB, LOWER_FLOOR_ALPHA]);
+        addGrid(R, C, wrap, (r, j) => along(r, M - 1, j), () => [CLEAR_RGB, LOWER_FLOOR_ALPHA]);
         // End wall: every ray tip joined to its neighbours.
-        addGrid(R, M, wrap, (r, k) => rayPoint(r, k, len[r * M + k]), tipColor);
+        const wallFirst = positions.length / 3;
+        addGrid(R, M, wrap, (r, k) => rayPoint(r, k, len[r * M + k]), (r, k) => {
+            wallHit[positions.length / 3 - 1 - wallFirst] = !!hit[r * M + k];
+            return [CLEAR_RGB, LOWER_WALL_ALPHA];
+        });
+        const wallEnd = positions.length / 3;
         // Side walls.
         if (!wrap) {
             for (const r of [0, R - 1]) {
@@ -900,7 +946,10 @@ export class CesiumRadarCoverage {
         }
 
         const mesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, new Float64Array(positions),
-            new Uint32Array(indices), Cesium.BoundingSphere.fromVertices(positions), v => colors[v]);
+            new Uint32Array(indices), Cesium.BoundingSphere.fromVertices(positions),
+            (v, red) => red && v >= wallFirst && v < wallEnd && wallHit[v - wallFirst]
+                ? [BLOCKED_RGB, colors[v][1]]
+                : colors[v]);
 
         // Floor edge line: the tips of the floor-angle rays.
         const edgeLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
@@ -918,129 +967,12 @@ export class CesiumRadarCoverage {
                 viewer.scene.primitives.remove(edgeLines);
             },
             setStyle: (st: RadarStyle) => {
-                const show = st.showBeam && st.showLowerBeams;
-                mesh.draw(show ? Cesium.Math.clamp(st.beamOpacity, 0, 1) : 0);
+                // The figure: red where rays stop on the terrain, green elsewhere.
+                const show = st.showLowerBeams;
+                const opacity = st.volumeTransparent ? Cesium.Math.clamp(st.volumeOpacity, 0.05, 0.99) : 1;
+                const light = st.volumeLit ? Cesium.Math.clamp(st.volumeLight, 0, 1) : 0;
+                mesh.draw(show ? opacity : 0, true, light);
                 edgeLines.show = show;
-            }
-        };
-    }
-
-    // -------------------------------------------------------------------
-    // 5. Ground the beam cannot reach: buildBlockedArea
-    // -------------------------------------------------------------------
-    // In every blocked direction, the ground from where the beam meets the
-    // terrain out to the full range is shaded red (draped on the terrain), and
-    // the line where the beam meets the terrain is drawn dark red.
-    private static buildBlockedArea(
-        viewer: Cesium.Viewer,
-        entityId: string,
-        grid: RayGrid,
-        tips: BeamTips,
-        runs: [number, number][],
-        lastCol: number
-    ): RadarCoverageHandle & { setStyle(st: RadarStyle): void } {
-        const rows = tips.hit.length;
-        const { rowAz, rowStepDeg, zone } = grid;
-        const half = rowStepDeg / 2;
-        let fillColor = BLOCKED_COLOR.withAlpha(DEFAULT_RADAR_STYLE.blockedOpacity);
-        let reachColor = CLEAR_COLOR.withAlpha(DEFAULT_RADAR_STYLE.blockedOpacity * REACH_ALPHA);
-        const material = new Cesium.ColorMaterialProperty(new Cesium.CallbackProperty(() => fillColor, false));
-        const fills: Cesium.Entity[] = [];
-        const hitLines: Cesium.Cartesian3[][] = [];
-
-        // Green: the ground under the beam, from the radar out to where the
-        // beam ends in each direction (the full range, or the hill it hits).
-        // It meets the red exactly at the hit line, so inside the range every
-        // spot is either green (the beam passes over it) or red (cut off).
-        const tipRing = Array.from({ length: rows }, (_, r) =>
-            CesiumRadarCoverage.planePoint(grid, rowAz[r], tips.dist[r]));
-        const reachPositions = grid.wrap
-            ? tipRing
-            : [
-                CesiumRadarCoverage.planePoint(grid, 0, 0),
-                CesiumRadarCoverage.planePoint(grid, rowAz[0] - half, tips.dist[0]),
-                ...tipRing,
-                CesiumRadarCoverage.planePoint(grid, rowAz[rows - 1] + half, tips.dist[rows - 1])
-            ];
-        const reach = viewer.entities.add({
-            polygon: {
-                hierarchy: new Cesium.PolygonHierarchy(reachPositions),
-                material: new Cesium.ColorMaterialProperty(new Cesium.CallbackProperty(() => reachColor, false)),
-                classificationType: Cesium.ClassificationType.TERRAIN
-            }
-        });
-        (reach as any).radarParentId = entityId;
-
-        const arc = (fromAz: number, toAz: number) => {
-            const steps = Math.max(1, Math.ceil(Math.abs(toAz - fromAz) / ARC_STEP_DEG));
-            return Array.from({ length: steps + 1 }, (_, s) =>
-                CesiumRadarCoverage.planePoint(grid, fromAz + ((toAz - fromAz) * s) / steps, zone.range));
-        };
-        const hitPoint = (row: number) => {
-            const g = CesiumRadarCoverage.groundAt(grid, row, tips.dist[row], lastCol);
-            return Cesium.Cartesian3.fromRadians(g.lon, g.lat, g.height);
-        };
-
-        viewer.entities.suspendEvents();
-        for (const run of runs) {
-            const rs = CesiumRadarCoverage.runRows(run, rows);
-            // Unwrapped azimuths so a run crossing north stays continuous.
-            const azs = rs.map((_, k) => rowAz[rs[0]] + k * rowStepDeg);
-            const fullRing = grid.wrap && rs.length === rows;
-            let hierarchy: Cesium.PolygonHierarchy;
-            if (fullRing) {
-                const inner = rs.map((r, k) => CesiumRadarCoverage.planePoint(grid, azs[k], tips.dist[r]));
-                hierarchy = new Cesium.PolygonHierarchy(arc(0, 360).slice(0, -1), [new Cesium.PolygonHierarchy(inner)]);
-            } else {
-                const first = rs[0], last = rs[rs.length - 1];
-                const inner = [
-                    CesiumRadarCoverage.planePoint(grid, azs[0] - half, tips.dist[first]),
-                    ...rs.map((r, k) => CesiumRadarCoverage.planePoint(grid, azs[k], tips.dist[r])),
-                    CesiumRadarCoverage.planePoint(grid, azs[azs.length - 1] + half, tips.dist[last])
-                ];
-                hierarchy = new Cesium.PolygonHierarchy([...inner, ...arc(azs[azs.length - 1] + half, azs[0] - half)]);
-            }
-            const fill = viewer.entities.add({
-                polygon: {
-                    hierarchy,
-                    material,
-                    classificationType: Cesium.ClassificationType.TERRAIN
-                }
-            });
-            (fill as any).radarParentId = entityId;
-            fills.push(fill);
-
-            const line = rs.map(hitPoint);
-            if (fullRing) line.push(line[0]);
-            if (line.length >= 2) hitLines.push(line);
-        }
-        viewer.entities.resumeEvents();
-
-        const lineMaterial = Cesium.Material.fromType("Color", { color: HIT_LINE_COLOR });
-        const outline = hitLines.length === 0 ? null : viewer.scene.primitives.add(new Cesium.GroundPolylinePrimitive({
-            geometryInstances: hitLines.map(positions => new Cesium.GeometryInstance({
-                geometry: new Cesium.GroundPolylineGeometry({ positions, width: 3 })
-            })),
-            appearance: new Cesium.PolylineMaterialAppearance({ material: lineMaterial }),
-            classificationType: Cesium.ClassificationType.TERRAIN,
-            asynchronous: false
-        })) as Cesium.GroundPolylinePrimitive | null;
-
-        return {
-            dispose: () => {
-                viewer.entities.suspendEvents();
-                for (const f of fills) viewer.entities.remove(f);
-                viewer.entities.remove(reach);
-                viewer.entities.resumeEvents();
-                if (outline) viewer.scene.primitives.remove(outline);
-            },
-            setStyle: (st: RadarStyle) => {
-                const opacity = Cesium.Math.clamp(st.blockedOpacity, 0, 1);
-                fillColor = BLOCKED_COLOR.withAlpha(opacity);
-                reachColor = CLEAR_COLOR.withAlpha(opacity * REACH_ALPHA);
-                for (const f of fills) f.show = st.showBlocked && opacity > 0;
-                reach.show = st.showBlocked && opacity > 0;
-                if (outline) outline.show = st.showBlocked;
             }
         };
     }
@@ -1245,7 +1177,7 @@ export class CesiumRadarCoverage {
         }
         return {
             dispose: () => viewer.scene.primitives.remove(labels),
-            setStyle: (st: RadarStyle) => { labels.show = st.showLabels; }
+            setStyle: (st: RadarStyle) => { labels.show = st.showLabels && !st.showLowerBeams; }
         };
     }
 
@@ -1269,71 +1201,6 @@ export class CesiumRadarCoverage {
         const mid = sector.fromDeg + sector.widthDeg / 2;
         if (sector.allRound) return "all round";
         return `${Math.round(sector.fromDeg)}°–${Math.round(sector.toDeg)}° (${CesiumRadarCoverage.compassOf(mid)})`;
-    }
-
-    // -------------------------------------------------------------------
-    // 7. The rays drawn on screen: buildRays
-    // -------------------------------------------------------------------
-    // `across` directions spread over the beam's width, traced at the beam's
-    // angle. A ray stops where it first meets the ground (orange, with a dot
-    // at the hit point) or runs to the full range (light green).
-    private static buildRays(
-        viewer: Cesium.Viewer,
-        grid: RayGrid,
-        radarHeight: number,
-        angle: number,
-        across: number
-    ): RadarCoverageHandle & { setStyle(st: RadarStyle): void } {
-        const { profiles, wrap } = grid;
-        const rows = profiles.length;
-        const lastCol = CesiumRadarCoverage.lastColumn(grid);
-
-        const rowSet = new Set<number>();
-        if (across === 1) rowSet.add(Math.floor(rows / 2));
-        else for (let k = 0; k < across; k++) {
-            rowSet.add(wrap ? Math.floor((k * rows) / across) : Math.round((k * (rows - 1)) / (across - 1)));
-        }
-
-        const lines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
-        const hits = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection()) as Cesium.PointPrimitiveCollection;
-        // One material per line (see buildBeam: shared ones are destroyed twice).
-        const hitColor = RAY_HIT_COLOR.withAlpha(0.95);
-        const clearColor = RAY_CLEAR_COLOR.withAlpha(0.7);
-
-        for (const r of rowSet) {
-            const tip = CesiumRadarCoverage.rayTip(grid, r, angle, lastCol);
-            const positions: Cesium.Cartesian3[] = [];
-            for (let k = 0; k <= RAY_LINE_POINTS; k++) {
-                const d = (tip.dist * k) / RAY_LINE_POINTS;
-                const g = CesiumRadarCoverage.groundAt(grid, r, d, lastCol);
-                const h = tip.hit && k === RAY_LINE_POINTS ? g.height : CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight);
-                positions.push(Cesium.Cartesian3.fromRadians(g.lon, g.lat, h));
-            }
-            lines.add({ positions, width: tip.hit ? 1.6 : 1.1, material: Cesium.Material.fromType("Color", { color: tip.hit ? hitColor : clearColor }) });
-
-            if (tip.hit) {
-                const g = CesiumRadarCoverage.groundAt(grid, r, tip.dist, lastCol);
-                hits.add({
-                    position: Cesium.Cartesian3.fromRadians(g.lon, g.lat, g.height + 2),
-                    pixelSize: 5,
-                    color: RAY_HIT_COLOR,
-                    outlineColor: Cesium.Color.WHITE,
-                    outlineWidth: 1,
-                    disableDepthTestDistance: HIT_POINT_ALWAYS_VISIBLE_M
-                });
-            }
-        }
-
-        return {
-            dispose: () => {
-                viewer.scene.primitives.remove(lines);
-                viewer.scene.primitives.remove(hits);
-            },
-            setStyle: (st: RadarStyle) => {
-                lines.show = st.showRays;
-                hits.show = st.showRays;
-            }
-        };
     }
 
     // -------------------------------------------------------------------
