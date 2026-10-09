@@ -223,16 +223,27 @@ const BEAM_NEAR_ALPHA = 0.25;
 // Faint range rings on the beam, as fractions of the range.
 const RANGE_RING_FRACTIONS = [0.25, 0.5, 0.75];
 const RANGE_RING_COLOR = Cesium.Color.WHITE.withAlpha(0.35);
-// Lower beams: the angle they start from, one level every this many degrees
-// (at most LOWER_MAX_LEVELS), and their opacity relative to the beam's.
+// "0° up to this angle" figure: the angle it starts from, points along each
+// direction, and the opacity of its faces relative to the figure's opacity.
 const LOWER_BEAMS_FLOOR_DEG = 0;
-const LOWER_LEVEL_STEP_DEG = 0.25;
-const LOWER_MAX_LEVELS = 120;
-const LOWER_FLOOR_ALPHA = 0.5;
+const VOLUME_POINTS = 160;
+const VOLUME_FACE_ALPHA = 0.5;
+// Where the figure's bottom comes within this of the ground (the beam
+// touching the terrain) it is left open, so the red ground shows.
+const VOLUME_GROUND_CLEARANCE_M = 15;
+// Step walls: drawn where a direction reaches further than its neighbour by
+// more than STEP_MIN_M and STEP_FRACTION of its own length; their detail.
+const STEP_MIN_M = 150;
+const STEP_FRACTION = 0.1;
+const STEP_WALL_POINTS = 24;
+// Ground map of "0° up to this angle" mode: opacity of the green (beam
+// passes over), red (rays hit the terrain) and dark (hidden) ground.
+const GROUND_MAP_CLEAR_ALPHA = 0.35;
+const GROUND_MAP_HIT_ALPHA = 0.7;
+const GROUND_MAP_HIDDEN_ALPHA = 0.55;
 // Shading of the lit figure: how high above the horizon the light is
 // (relative weight).
 const SHADE_LIGHT_UP = 0.5;
-const LOWER_WALL_ALPHA = 1.2;
 // Blocked sectors separated by a clear gap narrower than this are one sector
 // in the panel list and map labels (the map shading keeps every gap).
 const SECTOR_MERGE_GAP_DEG = 1;
@@ -436,15 +447,19 @@ export class CesiumRadarCoverage {
         const beam = CesiumRadarCoverage.buildBeam(viewer, entityId, grid, tips, radarHeight, angle, lastCol);
         const lower = CesiumRadarCoverage.buildLowerBeams(
             viewer, entityId, grid, radarHeight, Math.min(LOWER_BEAMS_FLOOR_DEG, elevationDeg), elevationDeg, lastCol);
+        const landings = CesiumRadarCoverage.buildGroundMap(
+            viewer, entityId, grid, longitude, latitude,
+            Cesium.Math.toRadians(Math.min(LOWER_BEAMS_FLOOR_DEG, elevationDeg)));
         const footprint = CesiumRadarCoverage.buildFootprint(
             viewer, entityId, grid, longitude, latitude,
             `${longitude}|${latitude}|${radarHeight}|${zone.azimuthStartDeg}|${widthDeg}|${zone.range}|${rows}`);
         const labels = CesiumRadarCoverage.buildSectorLabels(viewer, entityId, grid, tips, scan.sectors, lastCol);
-        handles.push(beam, lower, footprint, labels);
+        handles.push(beam, lower, landings, footprint, labels);
 
         const applyStyle = (st: RadarStyle) => {
             beam.setStyle(st);
             lower.setStyle(st);
+            landings.setStyle(st);
             footprint.setStyle(st);
             labels.setStyle(st);
             viewer.scene.requestRender();
@@ -854,15 +869,21 @@ export class CesiumRadarCoverage {
     // -------------------------------------------------------------------
     // 4b. Every lower angle, from the floor up to the beam: buildLowerBeams
     // -------------------------------------------------------------------
-    // Rays at every level between the floor angle (0°) and the beam's angle,
-    // each traced until it meets the terrain or runs the full range:
-    //   - floor: the sheet at the floor angle (faint)
-    //   - end wall: every ray tip joined to its neighbours up/down and
-    //     left/right. Red where the rays stop on a hill, green where they run
-    //     the full range, so the hills that cut into the lower angles show.
-    //   - side walls (beam < 360°): the rays of the two edge directions.
-    // The beam's own sheet (buildBeam) is the top. Nothing is drawn when the
-    // beam is at or below the floor.
+    // The airspace the beam covers between the floor angle (0°) and its own
+    // angle, as a solid figure built one slice per direction (each slice
+    // spans half way to its neighbours). At every distance along a direction
+    // the covered air runs:
+    //   - up to the top: the ray at the beam's angle
+    //   - down to the bottom: the lowest height the radar sees there, i.e.
+    //     the floor ray, or higher where nearer terrain hides the air below
+    //     (the line over the highest terrain so far). So the figure never goes
+    //     into a hill; where its bottom comes down to the ground the beam
+    //     touches the terrain, and the bottom is left open there so the red
+    //     ground (buildGroundMap) shows.
+    // A slice ends where the top ray meets the terrain, or with an end wall
+    // at the full range. Where a slice reaches clearly further than its
+    // neighbour, a straight step wall closes the step between them. All green;
+    // nothing is drawn when the beam is at or below the floor.
     private static buildLowerBeams(
         viewer: Cesium.Viewer,
         entityId: string,
@@ -872,108 +893,167 @@ export class CesiumRadarCoverage {
         topDeg: number,
         lastCol: number
     ): RadarCoverageHandle & { setStyle(st: RadarStyle): void } {
-        const span = topDeg - floorDeg;
-        if (span < 0.01) return { dispose: () => { }, setStyle: () => { } };
+        if (topDeg - floorDeg < 0.01) return { dispose: () => { }, setStyle: () => { } };
 
-        const { wrap, profiles } = grid;
+        const { wrap, profiles, rays } = grid;
         const rows = profiles.length;
         const R = Math.min(rows, BEAM_MESH_MAX_ROWS);
         const rowIdx = Array.from({ length: R }, (_, k) => wrap
             ? Math.floor((k * rows) / R)
             : Math.round((k * (rows - 1)) / Math.max(1, R - 1)));
-        const M = Cesium.Math.clamp(Math.ceil(span / LOWER_LEVEL_STEP_DEG) + 1, 2, LOWER_MAX_LEVELS);
-        const angles = Array.from({ length: M }, (_, k) => Cesium.Math.toRadians(floorDeg + (span * k) / (M - 1)));
-        const C = BEAM_RAY_POINTS;
+        const floorAngle = Cesium.Math.toRadians(floorDeg);
+        const topAngle = Cesium.Math.toRadians(topDeg);
+        const dists = profiles[0].horizontalDistances;
+        const spacing = dists.length > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
 
-        const len = new Float64Array(R * M);
-        const hit = new Uint8Array(R * M);
+        // Where each slice ends (the top ray), and whether on the terrain.
+        const end = new Float64Array(R);
+        const endsOnTerrain = new Uint8Array(R);
         for (let r = 0; r < R; r++) {
-            for (let k = 0; k < M; k++) {
-                const tip = CesiumRadarCoverage.rayTip(grid, rowIdx[r], angles[k], lastCol);
-                len[r * M + k] = tip.dist;
-                hit[r * M + k] = tip.hit ? 1 : 0;
-            }
+            const tip = CesiumRadarCoverage.rayTip(grid, rowIdx[r], topAngle, lastCol);
+            end[r] = tip.dist;
+            endsOnTerrain[r] = tip.hit ? 1 : 0;
         }
-        const rayPoint = (r: number, k: number, d: number) => {
-            const g = CesiumRadarCoverage.groundAt(grid, rowIdx[r], d, lastCol);
-            const onGround = hit[r * M + k] && d >= len[r * M + k];
-            return Cesium.Cartesian3.fromRadians(g.lon, g.lat,
-                onGround ? g.height : CesiumRadarCoverage.beamHeightAt(angles[k], d, radarHeight));
+        const prevOf = (r: number) => wrap ? (r - 1 + R) % R : r - 1;
+        const nextOf = (r: number) => wrap ? (r + 1) % R : (r + 1 < R ? r + 1 : -1);
+
+        // Heights of the top and the bottom of slice r at distance d.
+        const topAt = (d: number) => CesiumRadarCoverage.beamHeightAt(topAngle, d, radarHeight);
+        const bottomAt = (r: number, d: number) => {
+            const peak = rays[rowIdx[r]].peakAngle[Math.min(lastCol, Math.round(d / spacing))];
+            const angle = Math.min(topAngle, Math.max(floorAngle, Number.isFinite(peak) ? peak : floorAngle));
+            return CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight);
         };
-        const along = (r: number, k: number, j: number) => rayPoint(r, k, (len[r * M + k] * j) / (C - 1));
+        // Point of slice r at distance d and height h, on its edge towards
+        // neighbour n (half way between the two directions), or on the
+        // direction itself for an outer edge of the beam (n < 0).
+        const point = (r: number, n: number, d: number, h: number) => {
+            const a = CesiumRadarCoverage.groundAt(grid, rowIdx[r], d, lastCol);
+            if (n < 0) return Cesium.Cartesian3.fromRadians(a.lon, a.lat, h);
+            const b = CesiumRadarCoverage.groundAt(grid, rowIdx[n], d, lastCol);
+            return Cesium.Cartesian3.fromRadians((a.lon + b.lon) / 2, (a.lat + b.lat) / 2, h);
+        };
 
         const positions: number[] = [];
-        const colors: [number[], number][] = [];
         const indices: number[] = [];
-        const addGrid = (na: number, nb: number, wrapA: boolean,
-            pointOf: (a: number, b: number) => Cesium.Cartesian3,
-            colorOf: (a: number, b: number) => [number[], number]) => {
-            const first = positions.length / 3;
-            for (let a = 0; a < na; a++) {
-                for (let b = 0; b < nb; b++) {
-                    const p = pointOf(a, b);
-                    positions.push(p.x, p.y, p.z);
-                    colors.push(colorOf(a, b));
-                }
-            }
-            for (let a = 0; a < (wrapA ? na : na - 1); a++) {
-                const a2 = (a + 1) % na;
-                for (let b = 0; b < nb - 1; b++) {
-                    const p00 = first + a * nb + b, p01 = p00 + 1, p10 = first + a2 * nb + b, p11 = p10 + 1;
-                    indices.push(p00, p01, p10, p01, p11, p10);
-                }
+        const vertex = (p: Cesium.Cartesian3) => {
+            positions.push(p.x, p.y, p.z);
+            return positions.length / 3 - 1;
+        };
+        // Quad strip between two rows of points; keep(i) false leaves out the
+        // quad between points i and i + 1.
+        const strip = (a: Cesium.Cartesian3[], b: Cesium.Cartesian3[], keep: (i: number) => boolean = () => true) => {
+            const ia = a.map(vertex);
+            const ib = b.map(vertex);
+            for (let i = 0; i < a.length - 1; i++) {
+                if (!keep(i)) continue;
+                indices.push(ia[i], ia[i + 1], ib[i], ia[i + 1], ib[i + 1], ib[i]);
             }
         };
-        // Wall vertices that are ray tips on the terrain (red with the
-        // blockage layer on).
-        const wallHit: boolean[] = [];
 
-        // Floor sheet (0°) and top sheet (the beam's angle).
-        addGrid(R, C, wrap, (r, j) => along(r, 0, j), () => [CLEAR_RGB, LOWER_FLOOR_ALPHA]);
-        addGrid(R, C, wrap, (r, j) => along(r, M - 1, j), () => [CLEAR_RGB, LOWER_FLOOR_ALPHA]);
-        // End wall: every ray tip joined to its neighbours.
-        const wallFirst = positions.length / 3;
-        addGrid(R, M, wrap, (r, k) => rayPoint(r, k, len[r * M + k]), (r, k) => {
-            wallHit[positions.length / 3 - 1 - wallFirst] = !!hit[r * M + k];
-            return [CLEAR_RGB, LOWER_WALL_ALPHA];
-        });
-        const wallEnd = positions.length / 3;
-        // Side walls.
-        if (!wrap) {
-            for (const r of [0, R - 1]) {
-                addGrid(M, C, false, (k, j) => along(r, k, j), () => [CLEAR_RGB, LOWER_FLOOR_ALPHA]);
+        for (let r = 0; r < R; r++) {
+            const left = prevOf(r), right = nextOf(r);
+            const ds = Array.from({ length: VOLUME_POINTS }, (_, j) => (end[r] * j) / (VOLUME_POINTS - 1));
+            const tops = ds.map(topAt);
+            const bottoms = ds.map(d => bottomAt(r, d));
+            const nearGround = ds.map((d, j) =>
+                bottoms[j] - CesiumRadarCoverage.groundAt(grid, rowIdx[r], d, lastCol).height < VOLUME_GROUND_CLEARANCE_M);
+
+            // Top, and bottom (open where it lies on the ground).
+            strip(ds.map((d, j) => point(r, left, d, tops[j])), ds.map((d, j) => point(r, right, d, tops[j])));
+            strip(ds.map((d, j) => point(r, left, d, bottoms[j])), ds.map((d, j) => point(r, right, d, bottoms[j])),
+                j => !(nearGround[j] && nearGround[j + 1]));
+
+            // End wall at the full range.
+            if (!endsOnTerrain[r]) {
+                const d = end[r], b = bottoms[bottoms.length - 1], t = tops[tops.length - 1];
+                strip([point(r, left, d, b), point(r, left, d, t)], [point(r, right, d, b), point(r, right, d, t)]);
+            }
+
+            // Step walls on both sides (and the beam's outer edges): the
+            // slice's cross-section beyond where its neighbour ends.
+            for (const n of [left, right]) {
+                const outer = n < 0;
+                const from = outer ? 0 : Math.min(end[n], end[r]);
+                if (!outer && end[r] - from <= Math.max(STEP_MIN_M, STEP_FRACTION * end[r])) continue;
+                const ws = Array.from({ length: STEP_WALL_POINTS }, (_, j) =>
+                    from + ((end[r] - from) * j) / (STEP_WALL_POINTS - 1));
+                strip(ws.map(d => point(r, n, d, bottomAt(r, d))), ws.map(d => point(r, n, d, topAt(d))));
             }
         }
 
         const mesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, new Float64Array(positions),
             new Uint32Array(indices), Cesium.BoundingSphere.fromVertices(positions),
-            (v, red) => red && v >= wallFirst && v < wallEnd && wallHit[v - wallFirst]
-                ? [BLOCKED_RGB, colors[v][1]]
-                : colors[v]);
-
-        // Floor edge line: the tips of the floor-angle rays.
-        const edgeLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
-        const floorTips = Array.from({ length: R }, (_, r) => rayPoint(r, 0, len[r * M]));
-        if (wrap) floorTips.push(floorTips[0]);
-        edgeLines.add({
-            positions: floorTips,
-            width: 1.5,
-            material: Cesium.Material.fromType("Color", { color: CLEAR_COLOR.withAlpha(0.6) })
-        });
+            () => [CLEAR_RGB, VOLUME_FACE_ALPHA]);
 
         return {
-            dispose: () => {
-                mesh.dispose();
-                viewer.scene.primitives.remove(edgeLines);
-            },
+            dispose: () => mesh.dispose(),
             setStyle: (st: RadarStyle) => {
-                // The figure: red where rays stop on the terrain, green elsewhere.
                 const show = st.showLowerBeams;
                 const opacity = st.volumeTransparent ? Cesium.Math.clamp(st.volumeOpacity, 0.05, 0.99) : 1;
                 const light = st.volumeLit ? Cesium.Math.clamp(st.volumeLight, 0, 1) : 0;
-                mesh.draw(show ? opacity : 0, true, light);
-                edgeLines.show = show;
+                mesh.draw(show ? opacity : 0, false, light);
             }
+        };
+    }
+
+    // -------------------------------------------------------------------
+    // 4c. The ground under the figure: buildGroundMap
+    // -------------------------------------------------------------------
+    // "0° up to this angle" mode: every spot of ground inside the range gets
+    // one colour, draped on the terrain (so it follows the terrain shown at
+    // every zoom and the figure never has to touch the ground):
+    //   green: the radar sees this ground and it lies below the floor angle,
+    //          so the beam passes over it (covered from the floor upward)
+    //   red:   the radar sees this ground and it rises into the beam (above
+    //          the floor angle): the rays hit the terrain here
+    //   dark:  hidden behind nearer terrain, the beam cannot reach it
+    private static buildGroundMap(
+        viewer: Cesium.Viewer,
+        entityId: string,
+        grid: RayGrid,
+        longitude: number,
+        latitude: number,
+        floorAngle: number
+    ): RadarCoverageHandle & { setStyle(st: RadarStyle): void } {
+        const dists = grid.profiles[0].horizontalDistances;
+        const n = dists.length;
+        const clampM = FOOTPRINT_SCORE_CLAMP_M;
+        const floorTan = Math.tan(floorAngle);
+        // Per direction and sample, in metres (so edges blend smoothly):
+        // seen > 0 the radar sees the ground; above > 0 it is above the floor angle.
+        const seen: Float32Array[] = [];
+        const above: Float32Array[] = [];
+        for (const { groundAngle, peakAngle } of grid.rays) {
+            const s1 = new Float32Array(n).fill(clampM);
+            const s2 = new Float32Array(n).fill(-clampM);
+            for (let i = 1; i < n; i++) {
+                const d = dists[i];
+                const g = Math.tan(groundAngle[i]);
+                s2[i] = Cesium.Math.clamp((g - floorTan) * d, -clampM, clampM);
+                if (d < NEAR_FIELD_IGNORE_M || !Number.isFinite(peakAngle[i - 1])) continue;
+                s1[i] = Cesium.Math.clamp((g - Math.tan(peakAngle[i - 1])) * d, -clampM, clampM);
+            }
+            seen.push(s1);
+            above.push(s2);
+        }
+        const image = CesiumRadarCoverage.drawScoreImage(grid, longitude, latitude, [seen, above],
+            ([v, a]) => v <= 0 ? [HIDDEN_RGB, GROUND_MAP_HIDDEN_ALPHA]
+                : a > 0 ? [BLOCKED_RGB, GROUND_MAP_HIT_ALPHA]
+                    : [CLEAR_RGB, GROUND_MAP_CLEAR_ALPHA]);
+        if (!image) return { dispose: () => { }, setStyle: () => { } };
+
+        const fill = viewer.entities.add({
+            rectangle: {
+                coordinates: image.rectangle,
+                material: new Cesium.ImageMaterialProperty({ image: image.canvas, transparent: true }),
+                classificationType: Cesium.ClassificationType.TERRAIN
+            }
+        });
+        (fill as any).radarParentId = entityId;
+        return {
+            dispose: () => { viewer.entities.remove(fill); },
+            setStyle: (st: RadarStyle) => { fill.show = st.showLowerBeams; }
         };
     }
 
@@ -1031,17 +1111,13 @@ export class CesiumRadarCoverage {
     }
 
     private static drawFootprint(grid: RayGrid, longitude: number, latitude: number) {
-        const { zone, wrap, profiles, rays, rowStepDeg } = grid;
-        const rows = rays.length;
-        const dists = profiles[0].horizontalDistances;
+        const dists = grid.profiles[0].horizontalDistances;
         const n = dists.length;
-        const spacing = n > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
-        const range = zone.range;
         const clampM = FOOTPRINT_SCORE_CLAMP_M;
 
         // Per direction and sample: how far (metres) the ground rises above
         // the line of sight over the nearer terrain (> 0 seen, < 0 hidden).
-        const seen = rays.map(({ groundAngle, peakAngle }) => {
+        const seen = grid.rays.map(({ groundAngle, peakAngle }) => {
             const out = new Float32Array(n).fill(clampM);
             for (let i = 1; i < n; i++) {
                 const d = dists[i];
@@ -1051,7 +1127,28 @@ export class CesiumRadarCoverage {
             }
             return out;
         });
-        const scoreAt = (row: number, col: number) => {
+        return CesiumRadarCoverage.drawScoreImage(grid, longitude, latitude, [seen],
+            // Soft edge where seen meets hidden.
+            ([sc]) => [sc > 0 ? SEEN_RGB : HIDDEN_RGB, Math.min(1, 0.35 + Math.abs(sc) / 2)]);
+    }
+
+    // An image over the beam's area, to drape on the terrain: each pixel
+    // blends the scores of the nearest directions and samples and is painted
+    // by paint (colour and alpha 0-1), or left clear when paint gives null.
+    private static drawScoreImage(
+        grid: RayGrid,
+        longitude: number,
+        latitude: number,
+        scoreSets: Float32Array[][],
+        paint: (values: number[]) => [number[], number] | null
+    ) {
+        const { zone, wrap, profiles, rowStepDeg } = grid;
+        const rows = scoreSets[0].length;
+        const dists = profiles[0].horizontalDistances;
+        const n = dists.length;
+        const spacing = n > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
+        const range = zone.range;
+        const scoreAt = (seen: Float32Array[], row: number, col: number) => {
             const r0 = Math.floor(row), w = row - r0;
             const c0 = Math.min(Math.floor(col), n - 1), c1 = Math.min(c0 + 1, n - 1), u = col - Math.floor(col);
             const rowScore = (r: number) => {
@@ -1102,14 +1199,15 @@ export class CesiumRadarCoverage {
                 const az = (Cesium.Math.toDegrees(Math.atan2(east, north)) + 360) % 360;
                 const rel = (((az - zone.azimuthStartDeg) % 360) + 360) % 360;
                 if (!wrap && rel > zone.azimuthWidthDeg) continue;
-                const s = scoreAt(rel / rowStepDeg, dist / spacing);
-                const rgb = s > 0 ? SEEN_RGB : HIDDEN_RGB;
+                const row = rel / rowStepDeg, col = dist / spacing;
+                const painted = paint(scoreSets.map(set => scoreAt(set, row, col)));
+                if (!painted) continue;
+                const [rgb, alpha] = painted;
                 const o = (y * texW + x) * 4;
                 data[o] = rgb[0];
                 data[o + 1] = rgb[1];
                 data[o + 2] = rgb[2];
-                // Soft edge where seen meets hidden.
-                data[o + 3] = Math.round(255 * Math.min(1, 0.35 + Math.abs(s) / 2));
+                data[o + 3] = Math.round(255 * alpha);
             }
         }
         ctx.putImageData(img, 0, 0);
