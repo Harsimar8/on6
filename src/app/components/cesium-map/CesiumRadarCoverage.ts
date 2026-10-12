@@ -35,6 +35,8 @@ export interface BeamSettings {
 export interface RadarStyle {
     // "Only this angle" mode: showReach shows the part of the beam that clears
     // the terrain (green), showBlocked the part stopped by it (red).
+    // "0° up to this angle" mode: showReach shows the air and ground the
+    // radar sees (green), showBlocked the air and ground hidden (red).
     beamOpacity: number;
     showBeam: boolean;
     showReach: boolean;
@@ -1004,8 +1006,8 @@ export class CesiumRadarCoverage {
                 const show = st.showLowerBeams;
                 const opacity = st.volumeTransparent ? Cesium.Math.clamp(st.volumeOpacity, 0.05, 1) : 1;
                 const light = st.volumeLit ? Cesium.Math.clamp(st.volumeLight, 0, 1) : 0;
-                seenMesh.draw(show ? opacity : 0, false, light);
-                hiddenMesh.draw(show ? opacity : 0, false, light);
+                seenMesh.draw(show && st.showReach ? opacity : 0, false, light);
+                hiddenMesh.draw(show && st.showBlocked ? opacity : 0, false, light);
             }
         };
     }
@@ -1124,21 +1126,32 @@ export class CesiumRadarCoverage {
             }
             seen.push(s1);
         }
-        const image = CesiumRadarCoverage.drawScoreImage(grid, longitude, latitude, [seen],
-            ([v]) => v <= 0 ? [BLOCKED_RGB, GROUND_MAP_HIDDEN_ALPHA] : [CLEAR_RGB, GROUND_MAP_CLEAR_ALPHA]);
-        if (!image) return { dispose: () => { }, setStyle: () => { } };
-
-        const fill = viewer.entities.add({
-            rectangle: {
-                coordinates: image.rectangle,
-                material: new Cesium.ImageMaterialProperty({ image: image.canvas, transparent: true }),
-                classificationType: Cesium.ClassificationType.TERRAIN
-            }
-        });
-        (fill as any).radarParentId = entityId;
+        // Green and red are separate images, so Show green / Show red can
+        // switch each on and off.
+        const layer = (paint: (values: number[]) => [number[], number] | null) => {
+            const image = CesiumRadarCoverage.drawScoreImage(grid, longitude, latitude, [seen], paint);
+            if (!image) return null;
+            const fill = viewer.entities.add({
+                rectangle: {
+                    coordinates: image.rectangle,
+                    material: new Cesium.ImageMaterialProperty({ image: image.canvas, transparent: true }),
+                    classificationType: Cesium.ClassificationType.TERRAIN
+                }
+            });
+            (fill as any).radarParentId = entityId;
+            return fill;
+        };
+        const seenFill = layer(([v]) => v > 0 ? [CLEAR_RGB, GROUND_MAP_CLEAR_ALPHA] : null);
+        const hiddenFill = layer(([v]) => v <= 0 ? [BLOCKED_RGB, GROUND_MAP_HIDDEN_ALPHA] : null);
         return {
-            dispose: () => { viewer.entities.remove(fill); },
-            setStyle: (st: RadarStyle) => { fill.show = st.showLowerBeams; }
+            dispose: () => {
+                if (seenFill) viewer.entities.remove(seenFill);
+                if (hiddenFill) viewer.entities.remove(hiddenFill);
+            },
+            setStyle: (st: RadarStyle) => {
+                if (seenFill) seenFill.show = st.showLowerBeams && st.showReach;
+                if (hiddenFill) hiddenFill.show = st.showLowerBeams && st.showBlocked;
+            }
         };
     }
 

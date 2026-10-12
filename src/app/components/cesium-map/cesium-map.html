@@ -101,17 +101,19 @@
         </div>
 
         <div class="mode-options">
+          <label class="checkbox-field">
+            <input type="checkbox" [checked]="radarStyle().showReach"
+              (change)="onStyleChange({ showReach: $any($event.target).checked })">
+            <span><span class="swatch swatch--lit"></span>
+              {{ radarStyle().showLowerBeams ? 'Show green — air and ground the radar sees' : 'Show green — beam that clears the terrain' }}</span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" [checked]="radarStyle().showBlocked"
+              (change)="onStyleChange({ showBlocked: $any($event.target).checked })">
+            <span><span class="swatch swatch--blocked"></span>
+              {{ radarStyle().showLowerBeams ? 'Show red — air and ground hidden by terrain' : 'Show red — beam stopped by terrain' }}</span>
+          </label>
           @if (!radarStyle().showLowerBeams) {
-            <label class="checkbox-field">
-              <input type="checkbox" [checked]="radarStyle().showReach"
-                (change)="onStyleChange({ showReach: $any($event.target).checked })">
-              <span><span class="swatch swatch--lit"></span> Show green — beam that clears the terrain</span>
-            </label>
-            <label class="checkbox-field">
-              <input type="checkbox" [checked]="radarStyle().showBlocked"
-                (change)="onStyleChange({ showBlocked: $any($event.target).checked })">
-              <span><span class="swatch swatch--blocked"></span> Show red — beam stopped by terrain</span>
-            </label>
             <div class="beam-control">
               <div class="beam-control__header">
                 <span>Beam Opacity</span>
