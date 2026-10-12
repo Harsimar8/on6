@@ -224,9 +224,10 @@ const BEAM_NEAR_ALPHA = 0.25;
 const RANGE_RING_FRACTIONS = [0.25, 0.5, 0.75];
 const RANGE_RING_COLOR = Cesium.Color.WHITE.withAlpha(0.35);
 // "0° up to this angle" figures: points along each direction of the green
-// (seen air) and red (hidden air, over the full range) figure.
+// (seen air) figure, and at most this many range samples along each
+// direction of the red (hidden air) surface.
 const VOLUME_POINTS = 160;
-const SHADOW_VOLUME_POINTS = 240;
+const SHADOW_VOLUME_POINTS = 400;
 // Where the figure's bottom comes within this of the ground (the beam
 // touching the terrain) it is left open, so the ground map shows.
 const VOLUME_GROUND_CLEARANCE_M = 15;
@@ -881,9 +882,7 @@ export class CesiumRadarCoverage {
     //                   open where it lies on the ground, so the ground map shows.
     //   red (hidden):   from the ground up to that line (capped at the
     //                   beam's angle): the air nearer terrain hides, shaped
-    //                   by the terrain under it. Its bottom is open (it lies
-    //                   on the ground); between slices only the part above
-    //                   the neighbour's hidden air gets a wall.
+    //                   by the terrain under it (see shadowSurface).
     private static buildLowerBeams(
         viewer: Cesium.Viewer,
         entityId: string,
@@ -901,7 +900,6 @@ export class CesiumRadarCoverage {
         const topAngle = Cesium.Math.toRadians(topDeg);
         const dists = profiles[0].horizontalDistances;
         const spacing = dists.length > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
-        const fullRange = dists[lastCol];
 
         // Where each green slice ends (the top ray), and whether on the terrain.
         const end = new Float64Array(R);
@@ -926,14 +924,6 @@ export class CesiumRadarCoverage {
         // Bottom of the seen air: the line of sight, never below the ground
         // nor above the top.
         const bottomAt = (r: number, d: number) => Math.min(topAt(d), Math.max(groundH(r, d), sightAt(r, d)));
-        // Top of the hidden air: the line of sight, capped at the top. The
-        // ground itself where less than GROUND_MAP_TARGET_HEIGHT_M of air is
-        // hidden (terrain-data noise, as on the ground map).
-        const shadowTopAt = (r: number, d: number) => {
-            const g = groundH(r, d);
-            const h = Math.min(topAt(d), sightAt(r, d));
-            return h - g > GROUND_MAP_TARGET_HEIGHT_M ? h : g;
-        };
         // Point of slice r at distance d and height h, on its edge towards
         // neighbour n (half way between the two directions), or on the
         // direction itself for an outer edge of the beam (n < 0).
@@ -964,8 +954,6 @@ export class CesiumRadarCoverage {
             return { positions, indices, strip };
         };
         const seen = meshBuilder();
-        const hidden = meshBuilder();
-        const both = (flags: boolean[]) => (i: number) => flags[i] && flags[i + 1];
 
         for (let r = 0; r < R; r++) {
             const left = prevOf(r), right = nextOf(r);
@@ -997,42 +985,13 @@ export class CesiumRadarCoverage {
                     from + ((end[r] - from) * j) / (STEP_WALL_POINTS - 1));
                 seen.strip(ws.map(d => point(r, n, d, bottomAt(r, d))), ws.map(d => point(r, n, d, topAt(d))));
             }
-
-            // Hidden air (red), over the full range.
-            const hs = Array.from({ length: SHADOW_VOLUME_POINTS }, (_, j) => (fullRange * j) / (SHADOW_VOLUME_POINTS - 1));
-            const grounds = hs.map(d => groundH(r, d));
-            const caps = hs.map(d => shadowTopAt(r, d));
-            const has = caps.map((c, j) => c > grounds[j]);
-
-            // Top (the bottom lies on the ground and stays open).
-            hidden.strip(hs.map((d, j) => point(r, left, d, caps[j])), hs.map((d, j) => point(r, right, d, caps[j])), both(has));
-
-            // End wall at the full range.
-            const last = hs.length - 1;
-            if (has[last]) {
-                const d = hs[last];
-                hidden.strip([point(r, left, d, grounds[last]), point(r, left, d, caps[last])],
-                    [point(r, right, d, grounds[last]), point(r, right, d, caps[last])]);
-            }
-
-            // Side walls: the part above the neighbour's hidden air (from
-            // the ground at the beam's outer edges), so neighbouring slices
-            // never draw the same face twice.
-            for (const n of [left, right]) {
-                const lows = hs.map((d, j) => n < 0
-                    ? grounds[j]
-                    : Math.max((grounds[j] + groundH(n, d)) / 2, shadowTopAt(n, d)));
-                const wall = hs.map((_, j) => has[j] && caps[j] > lows[j] + 0.5);
-                hidden.strip(hs.map((d, j) => point(r, n, d, lows[j])),
-                    hs.map((d, j) => point(r, n, d, Math.max(lows[j], caps[j]))), both(wall));
-            }
         }
 
-        const toMesh = (m: ReturnType<typeof meshBuilder>, rgb: number[]) => CesiumRadarCoverage.coloredMesh(
+        const toMesh = (m: { positions: number[]; indices: number[] }, rgb: number[]) => CesiumRadarCoverage.coloredMesh(
             viewer, entityId, new Float64Array(m.positions), new Uint32Array(m.indices),
             Cesium.BoundingSphere.fromVertices(m.positions), () => [rgb, 1]);
         const seenMesh = toMesh(seen, CLEAR_RGB);
-        const hiddenMesh = toMesh(hidden, BLOCKED_RGB);
+        const hiddenMesh = toMesh(CesiumRadarCoverage.shadowSurface(grid, rowIdx, radarHeight, topAngle, lastCol), BLOCKED_RGB);
 
         return {
             dispose: () => {
@@ -1049,6 +1008,89 @@ export class CesiumRadarCoverage {
                 hiddenMesh.draw(show ? opacity : 0, false, light);
             }
         };
+    }
+
+    // The top of the hidden (red) air as one surface over every direction
+    // and range sample, by the ground map's rule: where the line of sight
+    // over the nearer terrain passes more than GROUND_MAP_TARGET_HEIGHT_M
+    // above the ground, the surface lies on that line (capped at the beam's
+    // angle); elsewhere on the ground. Only triangles touching hidden air are
+    // kept, so the red figure slopes down to the ground at its edges (as the
+    // ground map blends between directions) instead of ending in walls.
+    // Walls close it at the full range and at the beam's side edges.
+    private static shadowSurface(
+        grid: RayGrid,
+        rowIdx: number[],
+        radarHeight: number,
+        topAngle: number,
+        lastCol: number
+    ): { positions: number[]; indices: number[] } {
+        const R = rowIdx.length;
+        const dists = grid.profiles[0].horizontalDistances;
+        const stride = Math.max(1, Math.ceil(lastCol / SHADOW_VOLUME_POINTS));
+        const cols: number[] = [];
+        for (let c = 0; c < lastCol; c += stride) cols.push(c);
+        cols.push(lastCol);
+        const C = cols.length;
+
+        const positions: number[] = [];
+        const vertexAt = (k: number, j: number, h: number) => {
+            const pt = grid.profiles[rowIdx[k]].groundPoints[cols[j]];
+            const p = Cesium.Cartesian3.fromRadians(pt.longitude, pt.latitude, h);
+            positions.push(p.x, p.y, p.z);
+            return positions.length / 3 - 1;
+        };
+
+        // Surface vertex k * C + j: direction k, range sample cols[j].
+        const hidden = new Uint8Array(R * C);
+        for (let k = 0; k < R; k++) {
+            const { groundHeights } = grid.profiles[rowIdx[k]];
+            const { peakAngle } = grid.rays[rowIdx[k]];
+            for (let j = 0; j < C; j++) {
+                const c = cols[j], d = dists[c], g = groundHeights[c];
+                let h = g;
+                if (c > 0 && d >= NEAR_FIELD_IGNORE_M && Number.isFinite(peakAngle[c - 1])) {
+                    const cap = Math.min(
+                        CesiumRadarCoverage.beamHeightAt(topAngle, d, radarHeight),
+                        CesiumRadarCoverage.beamHeightAt(peakAngle[c - 1], d, radarHeight));
+                    if (cap - g > GROUND_MAP_TARGET_HEIGHT_M) {
+                        h = cap;
+                        hidden[k * C + j] = 1;
+                    }
+                }
+                vertexAt(k, j, h);
+            }
+        }
+
+        const indices: number[] = [];
+        const v = (k: number, j: number) => k * C + j;
+        const tri = (a: number, b: number, c: number) => {
+            if (hidden[a] || hidden[b] || hidden[c]) indices.push(a, b, c);
+        };
+        for (let k = 0; k < (grid.wrap ? R : R - 1); k++) {
+            const k2 = (k + 1) % R;
+            for (let j = 0; j < C - 1; j++) {
+                tri(v(k, j), v(k2, j), v(k, j + 1));
+                tri(v(k, j + 1), v(k2, j), v(k2, j + 1));
+            }
+        }
+
+        // Wall from the surface down to the ground along the edge between
+        // surface vertices (ka, ja) and (kb, jb), where either is hidden.
+        const wall = (ka: number, ja: number, kb: number, jb: number) => {
+            const a = v(ka, ja), b = v(kb, jb);
+            if (!hidden[a] && !hidden[b]) return;
+            const ga = vertexAt(ka, ja, grid.profiles[rowIdx[ka]].groundHeights[cols[ja]]);
+            const gb = vertexAt(kb, jb, grid.profiles[rowIdx[kb]].groundHeights[cols[jb]]);
+            indices.push(a, b, ga, b, gb, ga);
+        };
+        for (let k = 0; k < (grid.wrap ? R : R - 1); k++) wall(k, C - 1, (k + 1) % R, C - 1);
+        if (!grid.wrap) {
+            for (const k of [0, R - 1]) {
+                for (let j = 0; j < C - 1; j++) wall(k, j, k, j + 1);
+            }
+        }
+        return { positions, indices };
     }
 
     // -------------------------------------------------------------------
