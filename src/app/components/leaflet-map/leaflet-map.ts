@@ -120,6 +120,8 @@ this.syncTimeout = setTimeout(() => {
   private animationFrame?: number;
   private syncing = false;
   private syncTimeout?: ReturnType<typeof setTimeout>;
+  // Keeps the map filling its box when the side panel or toolbar is resized.
+  private resizeObserver?: ResizeObserver;
   public readonly teamFilterService = inject(TeamFilterService);
   protected readonly TeamFilter = TeamFilter;
 
@@ -127,6 +129,8 @@ this.syncTimeout = setTimeout(() => {
 
     this.initializeMap();
 
+    this.resizeObserver = new ResizeObserver(() => this.map?.invalidateSize());
+    this.resizeObserver.observe(this.mapContainer.nativeElement);
 
   }
 
@@ -236,6 +240,7 @@ setRedForces(): void {
 }
   ngOnDestroy(): void {
 
+    this.resizeObserver?.disconnect();
     this.map.remove();
 
   }

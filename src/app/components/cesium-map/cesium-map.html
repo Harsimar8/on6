@@ -99,19 +99,29 @@
             (click)="onStyleChange({ showLowerBeams: true })"
             title="Also show every lower angle from 0° up to the beam">0° up to this angle</button>
         </div>
+        @if (!radarStyle().showLowerBeams) {
+          <div class="view-toggle" role="group" aria-label="How to show blocked rays">
+            <button class="chip" [class.active]="!radarStyle().showStopPoints"
+              (click)="onStyleChange({ showStopPoints: false })"
+              title="Rays stopped by terrain are red, rays that reach full range are green">Red / green rays</button>
+            <button class="chip" [class.active]="radarStyle().showStopPoints"
+              (click)="onStyleChange({ showStopPoints: true })"
+              title="Whole beam green, red points where each ray is stopped by terrain">Green + stop points</button>
+          </div>
+        }
 
         <div class="mode-options">
           <label class="checkbox-field">
             <input type="checkbox" [checked]="radarStyle().showReach"
               (change)="onStyleChange({ showReach: $any($event.target).checked })">
             <span><span class="swatch swatch--lit"></span>
-              {{ radarStyle().showLowerBeams ? 'Show green — air and ground the radar sees' : 'Show green — beam that clears the terrain' }}</span>
+              {{ radarStyle().showLowerBeams ? 'Show green — air and ground the radar sees' : radarStyle().showStopPoints ? 'Show green — the beam' : 'Show green — beam that clears the terrain' }}</span>
           </label>
           <label class="checkbox-field">
             <input type="checkbox" [checked]="radarStyle().showBlocked"
               (change)="onStyleChange({ showBlocked: $any($event.target).checked })">
             <span><span class="swatch swatch--blocked"></span>
-              {{ radarStyle().showLowerBeams ? 'Show red — air and ground hidden by terrain' : 'Show red — beam stopped by terrain' }}</span>
+              {{ radarStyle().showLowerBeams ? 'Show red — air and ground hidden by terrain' : radarStyle().showStopPoints ? 'Show red — points where rays are stopped' : 'Show red — beam stopped by terrain' }}</span>
           </label>
           @if (!radarStyle().showLowerBeams) {
             <div class="beam-control">

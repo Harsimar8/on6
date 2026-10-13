@@ -1,10 +1,29 @@
+
 <div class="app">
 
-  <app-toolbar></app-toolbar>
+  @if (!toolbarCollapsed()) {
+    <app-toolbar></app-toolbar>
+  }
+  <button class="toolbar-toggle" (click)="toggleToolbar()"
+    [title]="toolbarCollapsed() ? 'Show toolbar' : 'Hide toolbar'">
+    {{ toolbarCollapsed() ? '▼' : '▲' }}
+  </button>
 
   <div class="main-content">
 
-    <app-asset-browser></app-asset-browser>
+    @if (!sidebarCollapsed()) {
+      <app-asset-browser [style.width.px]="sidebarWidth()"></app-asset-browser>
+    }
+
+    <div class="sidebar-splitter" [class.dragging]="dragging()"
+      (pointerdown)="startResize($event)"
+      (dblclick)="toggleSidebar()"
+      title="Drag to resize · double-click to hide/show">
+      <button class="sidebar-toggle" (pointerdown)="$event.stopPropagation()" (click)="toggleSidebar()"
+        [title]="sidebarCollapsed() ? 'Show panel' : 'Hide panel'">
+        {{ sidebarCollapsed() ? '▶' : '◀' }}
+      </button>
+    </div>
 
     <app-map></app-map>
 

@@ -45,6 +45,10 @@ export interface RadarStyle {
     // Also show every lower angle from 0° up to the beam (a solid fan), not
     // just the sheet at the beam's own angle.
     showLowerBeams: boolean;
+    // "Only this angle" mode: draw the whole beam green and mark with red
+    // points where each blocked ray meets the terrain (showBlocked toggles
+    // the points), instead of colouring blocked directions red.
+    showStopPoints: boolean;
     // "0° up to this angle" mode: shade the solid figure by the light, and
     // draw it see-through (else opaque).
     volumeLit: boolean;
@@ -180,6 +184,7 @@ export const DEFAULT_RADAR_STYLE: RadarStyle = {
     showBlocked: true,
     showLabels: true,
     showLowerBeams: false,
+    showStopPoints: false,
     volumeLit: true,
     volumeTransparent: true,
     volumeLight: 0.65,
@@ -218,13 +223,11 @@ const RIDGE_TOLERANCE_M = 2;
 // Beam sheet: at most this many directions, and points along each.
 const BEAM_MESH_MAX_ROWS = 360;
 const BEAM_RAY_POINTS = 40;
-// The beam sheet fades in from the antenna: alpha at the antenna, relative
-// to the far end (radar-display look, and the ground near the radar stays
-// readable).
-const BEAM_NEAR_ALPHA = 0.25;
 // Faint range rings on the beam, as fractions of the range.
 const RANGE_RING_FRACTIONS = [0.25, 0.5, 0.75];
 const RANGE_RING_COLOR = Cesium.Color.WHITE.withAlpha(0.35);
+// Stop points ("all green + stop points" view): size in pixels.
+const STOP_POINT_PX = 6;
 // "0° up to this angle" figures: points along each direction of the green
 // (seen air) figure, and at most this many range samples along each
 // direction of the red (hidden air) surface.
@@ -314,7 +317,9 @@ export class CesiumRadarCoverage {
             volumeLit: props["volumeLit"] ?? DEFAULT_RADAR_STYLE.volumeLit,
             volumeTransparent: props["volumeTransparent"] ?? DEFAULT_RADAR_STYLE.volumeTransparent,
             volumeLight: props["volumeLight"] ?? DEFAULT_RADAR_STYLE.volumeLight,
-            volumeOpacity: props["volumeOpacity"] ?? DEFAULT_RADAR_STYLE.volumeOpacity,            showFootprint: props["showFootprint"] ?? DEFAULT_RADAR_STYLE.showFootprint,
+            showStopPoints: props["showStopPoints"] ?? DEFAULT_RADAR_STYLE.showStopPoints,
+            volumeOpacity: props["volumeOpacity"] ?? DEFAULT_RADAR_STYLE.volumeOpacity,
+            showFootprint: props["showFootprint"] ?? DEFAULT_RADAR_STYLE.showFootprint,
             footprintOpacity: props["footprintOpacity"] ?? DEFAULT_RADAR_STYLE.footprintOpacity
         };
     }
@@ -694,6 +699,8 @@ export class CesiumRadarCoverage {
         // blocked (red, on the terrain: part of the blockage layer) stretches.
         const tipLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         const hitTipLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
+        // The same blocked stretches in green, for the stop-points view.
+        const hitTipLinesGreen = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         // Every polyline needs its own material: a PolylineCollection destroys
         // each line's material when it is removed, so a shared one would be
         // destroyed twice and throw, leaving the rest of the old beam behind.
@@ -712,6 +719,7 @@ export class CesiumRadarCoverage {
                 (state ? hitTipLines : tipLines).add({
                     positions: pts, width: 2.5, material: lineMaterial(state ? BLOCKED_COLOR : CLEAR_COLOR)
                 });
+                if (state) hitTipLinesGreen.add({ positions: pts, width: 2.5, material: lineMaterial(CLEAR_COLOR) });
             }
             k = next;
         }
@@ -742,11 +750,26 @@ export class CesiumRadarCoverage {
             }
         }
 
-        const alongAlpha = (v: number) => BEAM_NEAR_ALPHA + (1 - BEAM_NEAR_ALPHA) * ((v % C) / (C - 1));
+        // Stop points: where every blocked direction (all rows, not just the
+        // mesh rows) meets the terrain. Drawn over the terrain so a point
+        // on the hillside is never half buried in it.
+        const stopPoints = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection()) as Cesium.PointPrimitiveCollection;
+        for (let row = 0; row < rows; row++) {
+            if (!tips.hit[row]) continue;
+            stopPoints.add({
+                position: tipOf(row),
+                pixelSize: STOP_POINT_PX,
+                color: BLOCKED_COLOR,
+                outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
+                outlineWidth: 1,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY
+            });
+        }
+
         const clearMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
-            new Uint32Array(clearIndices), boundingSphere, v => [CLEAR_RGB, alongAlpha(v)]);
+            new Uint32Array(clearIndices), boundingSphere, () => [CLEAR_RGB, 1]);
         const blockedMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
-            new Uint32Array(blockedIndices), boundingSphere, v => [BLOCKED_RGB, alongAlpha(v)]);
+            new Uint32Array(blockedIndices), boundingSphere, (_, red) => [red ? BLOCKED_RGB : CLEAR_RGB, 1]);
 
         return {
             dispose: () => {
@@ -754,16 +777,25 @@ export class CesiumRadarCoverage {
                 blockedMesh.dispose();
                 viewer.scene.primitives.remove(tipLines);
                 viewer.scene.primitives.remove(hitTipLines);
+                viewer.scene.primitives.remove(hitTipLinesGreen);
+                viewer.scene.primitives.remove(stopPoints);
             },
             // "Only this angle" mode: Show green = the part of the beam that
             // clears the terrain, Show red = the part stopped by it.
+            // Stop-points view: Show green = the whole beam (green), Show red
+            // = red points where blocked rays meet the terrain.
             setStyle: (st: RadarStyle) => {
                 const thisAngle = !st.showLowerBeams;
+                const points = thisAngle && st.showStopPoints;
                 const opacity = Cesium.Math.clamp(st.beamOpacity, 0, 1);
                 clearMesh.draw(thisAngle && st.showReach ? opacity : 0, false);
-                blockedMesh.draw(thisAngle && st.showBlocked ? opacity : 0, false);
+                blockedMesh.draw(points
+                    ? (st.showReach ? opacity : 0)
+                    : (thisAngle && st.showBlocked ? opacity : 0), !points);
                 tipLines.show = thisAngle && st.showReach;
-                hitTipLines.show = thisAngle && st.showBlocked;
+                hitTipLines.show = thisAngle && !points && st.showBlocked;
+                hitTipLinesGreen.show = points && st.showReach;
+                stopPoints.show = points && st.showBlocked;
             }
         };
     }
@@ -1373,7 +1405,7 @@ export class CesiumRadarCoverage {
         }
         return {
             dispose: () => viewer.scene.primitives.remove(labels),
-            setStyle: (st: RadarStyle) => { labels.show = st.showLabels && !st.showLowerBeams; }
+            setStyle: (st: RadarStyle) => { labels.show = st.showLabels && !st.showLowerBeams && !st.showStopPoints; }
         };
     }
 

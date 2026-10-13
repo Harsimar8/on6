@@ -12,6 +12,9 @@
 
   </div>
 
-  <app-property-panel></app-property-panel>
+  <div class="panel-splitter" [class.dragging]="dragging()" (pointerdown)="startResize($event)"
+    title="Drag to resize the property panel"></div>
+
+  <app-property-panel [style.height.px]="panelHeight()"></app-property-panel>
 
 </div>
